@@ -1,0 +1,7 @@
+*.exe
+*.test
+*.out
+go.work
+
+.workbuddy/
+.codebuddy/

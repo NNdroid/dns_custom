@@ -1,0 +1,24 @@
+{
+  "_description": "dns_custom DNS Tunnel Client Configuration",
+  "_fields": {
+    "mode": "Operational mode: 'client'",
+    "listen": "Local TCP port for local applications to connect to (e.g. 127.0.0.1:1080 for SOCKS/SSH)",
+    "domain": "Authoritative DNS tunnel domain matching the server domain",
+    "servers": "Upstream DNS resolvers (supports standard UDP/TCP :53, DoT tls://, and DoH https://)",
+    "record_type": "DNS query record type: txt (recommended), null, cname, a, aaaa, mx, srv, ns",
+    "pubkey": "Server Noise Curve25519 static public key for end-to-end AEAD encryption",
+    "log_level": "Logging verbosity: debug, info, warn, error"
+  },
+  "mode": "client",
+  "listen": "127.0.0.1:1080",
+  "domain": "tunnel.example.com",
+  "servers": [
+    "8.8.8.8:53",
+    "1.1.1.1:53",
+    "https://1.1.1.1/dns-query",
+    "tls://1.1.1.1:853"
+  ],
+  "record_type": "txt",
+  "pubkey": "",
+  "log_level": "info"
+}
