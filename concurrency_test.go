@@ -10,7 +10,6 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/miekg/dns"
 )
@@ -38,19 +37,15 @@ func startEchoBackend(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// startTunnelServer boots a DNSServer on a fixed UDP port and shuts it down with the test.
-func startTunnelServer(t *testing.T, addr, domain, target, privKey string) {
+// startTunnelServer boots a DNSServer on an OS-assigned UDP port.
+func startTunnelServer(t *testing.T, domain, target, privKey string) string {
 	t.Helper()
 	srv := NewDNSServer(ServerConfig{
-		ListenAddr: addr,
 		Domain:     domain,
 		TargetAddr: target,
 		PrivateKey: privKey,
 	})
-	udpServer := &dns.Server{Addr: addr, Net: "udp", Handler: srv}
-	go func() { _ = udpServer.ListenAndServe() }()
-	t.Cleanup(func() { _ = udpServer.Shutdown() })
-	time.Sleep(100 * time.Millisecond)
+	return startTestDNSServer(t, srv)
 }
 
 // TestNoiseNonceIsSequenceDerived locks in the P0 fix: the AEAD nonce must be derived
@@ -142,8 +137,7 @@ func TestMultiServerPathsAddUp(t *testing.T) {
 
 	echoAddr := startEchoBackend(t)
 	domain := "tunnel.multipath.local"
-	dnsAddr := "127.0.0.1:29551"
-	startTunnelServer(t, dnsAddr, domain, echoAddr, "")
+	dnsAddr := startTunnelServer(t, domain, echoAddr, "")
 
 	dead := "127.0.0.1:1" // nothing listens, so the exchange fails fast
 	for _, servers := range [][]string{
@@ -187,8 +181,7 @@ func TestConcurrentNoiseTransfer(t *testing.T) {
 	pubHex, _ := FormatNoiseKey(kp.PublicKey)
 
 	domain := "tunnel.concurrent.local"
-	dnsAddr := "127.0.0.1:29552"
-	startTunnelServer(t, dnsAddr, domain, echoAddr, privHex)
+	dnsAddr := startTunnelServer(t, domain, echoAddr, privHex)
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsAddr}, domain, "txt", pubHex)
 	if err != nil {
@@ -210,7 +203,17 @@ func TestConcurrentNoiseTransfer(t *testing.T) {
 		t.Fatalf("tunnel read failed: %v", err)
 	}
 	if !bytes.Equal(recvBuf, payload) {
-		t.Fatalf("concurrent noisy transfer corrupted (first diff at %d)", firstDiff(recvBuf, payload))
+		diff := firstDiff(recvBuf, payload)
+		start := diff - 16
+		if start < 0 {
+			start = 0
+		}
+		end := diff + 32
+		if end > len(payload) {
+			end = len(payload)
+		}
+		t.Fatalf("concurrent noisy transfer corrupted at byte %d: got[%d:%d]=%x want=%x",
+			diff, start, end, recvBuf[start:end], payload[start:end])
 	}
 }
 
@@ -345,12 +348,8 @@ func benchmarkTunnelThroughput(b *testing.B, paths int) {
 	}()
 
 	domain := "tunnel.bench.local"
-	dnsAddr := fmt.Sprintf("127.0.0.1:2960%d", paths)
-	srv := NewDNSServer(ServerConfig{ListenAddr: dnsAddr, Domain: domain, TargetAddr: echoLn.Addr().String()})
-	udpServer := &dns.Server{Addr: dnsAddr, Net: "udp", Handler: srv}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-	time.Sleep(100 * time.Millisecond)
+	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	dnsAddr := startTestDNSServer(b, srv)
 
 	servers := make([]string, 0, paths)
 	for i := 0; i < paths; i++ {

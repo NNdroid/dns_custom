@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"strings"
 
 	"golang.org/x/crypto/blake2s"
@@ -63,7 +64,7 @@ func ParseNoiseKey(s string) ([32]byte, error) {
 		copy(key[:], b)
 		return key, nil
 	}
-	return key, fmt.Errorf("invalid key format: %s (expected 64 hex chars or 32-byte base64)", s)
+	return key, fmt.Errorf("invalid key format (expected 64 hex chars or 32-byte base64)")
 }
 
 // FormatNoiseKey formats a 32-byte key to hex and base64
@@ -147,10 +148,10 @@ func NewClientNoiseSession(serverPubkey [32]byte) (*NoiseSession, []byte, error)
 	kdf := hkdf.New(blake2sHash, dh, serverPubkey[:], []byte("dns_custom_noise_v1"))
 	kC2S := make([]byte, 32)
 	kS2C := make([]byte, 32)
-	if _, err := kdf.Read(kC2S); err != nil {
+	if _, err := io.ReadFull(kdf, kC2S); err != nil {
 		return nil, nil, err
 	}
-	if _, err := kdf.Read(kS2C); err != nil {
+	if _, err := io.ReadFull(kdf, kS2C); err != nil {
 		return nil, nil, err
 	}
 
@@ -184,10 +185,10 @@ func NewServerNoiseSession(serverPrivkey [32]byte, clientEPub []byte) (*NoiseSes
 	kdf := hkdf.New(blake2sHash, dh, serverPub, []byte("dns_custom_noise_v1"))
 	kC2S := make([]byte, 32)
 	kS2C := make([]byte, 32)
-	if _, err := kdf.Read(kC2S); err != nil {
+	if _, err := io.ReadFull(kdf, kC2S); err != nil {
 		return nil, err
 	}
-	if _, err := kdf.Read(kS2C); err != nil {
+	if _, err := io.ReadFull(kdf, kS2C); err != nil {
 		return nil, err
 	}
 

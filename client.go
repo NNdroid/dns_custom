@@ -32,6 +32,11 @@ const dnsTunnelPathCooldown = 2 * time.Second
 // query itself - it was the real ceiling on how much concurrency could buy.
 const dnsTunnelConnPool = 32
 
+// DNS over TCP has a 16-bit message length prefix, so a larger DoH body can
+// never be a valid DNS message. Capping it prevents a bad endpoint from forcing
+// an unbounded allocation in io.ReadAll.
+const maxDNSWireMessageSize = 65535
+
 // dnsPath is one upstream resolver plus its warm socket pool. A pooled socket is owned
 // exclusively by the query that is in flight on it: a shared socket would let one
 // caller's read steal another caller's response.
@@ -64,7 +69,9 @@ func newDNSPath(server string) *dnsPath {
 		p.network, p.addr = "udp", server
 	}
 	if p.dohURL != "" {
-		p.httpCli = &http.Client{Timeout: 4 * time.Second}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConnsPerHost = dnsTunnelConnPool
+		p.httpCli = &http.Client{Transport: transport, Timeout: 4 * time.Second}
 	} else {
 		p.dnsCli = &dns.Client{Net: p.network, Timeout: 4 * time.Second}
 	}
@@ -73,12 +80,23 @@ func newDNSPath(server string) *dnsPath {
 
 // acquire returns a warm socket, dialing one if the pool is empty.
 func (p *dnsPath) acquire() (*dns.Conn, error) {
+	if p.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	select {
 	case co := <-p.pool:
 		return co, nil
 	default:
 	}
-	return p.dnsCli.Dial(p.addr)
+	co, err := p.dnsCli.Dial(p.addr)
+	if err != nil {
+		return nil, err
+	}
+	if p.closed.Load() {
+		_ = co.Close()
+		return nil, net.ErrClosed
+	}
+	return co, nil
 }
 
 func (p *dnsPath) release(co *dns.Conn) {
@@ -99,6 +117,9 @@ func (p *dnsPath) release(co *dns.Conn) {
 func (p *dnsPath) close() {
 	if !p.closed.CompareAndSwap(false, true) {
 		return
+	}
+	if p.httpCli != nil {
+		p.httpCli.CloseIdleConnections()
 	}
 	for {
 		select {
@@ -149,9 +170,12 @@ func (p *dnsPath) exchangeDoH(ctx context.Context, m *dns.Msg) (*dns.Msg, error)
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("doh server returned status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDNSWireMessageSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxDNSWireMessageSize {
+		return nil, fmt.Errorf("doh response is larger than %d bytes", maxDNSWireMessageSize)
 	}
 	reply := new(dns.Msg)
 	if err := reply.Unpack(body); err != nil {
@@ -202,6 +226,7 @@ type DNSClientTunnel struct {
 	recvNext uint32            // next expected downstream serverSeq
 	recvOOO  map[uint32][]byte // out-of-order downstream chunks buffered for in-order delivery
 	recvMu   sync.Mutex
+	writeMu  sync.Mutex // serializes Write calls so the byte-stream order is unambiguous
 }
 
 func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string) (*DNSClientTunnel, error) {
@@ -238,16 +263,25 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 	if pubKeyStr != "" {
 		if qtype == dns.TypeA || qtype == dns.TypeAAAA {
 			cancel()
+			for _, p := range paths {
+				p.close()
+			}
 			return nil, fmt.Errorf("record type %q cannot carry authenticated Noise frames (A/AAAA hold 4/16 bytes); use txt/null/cname/mx/srv/ns", recordType)
 		}
 		pk, err := ParseNoiseKey(pubKeyStr)
 		if err != nil {
 			cancel()
+			for _, p := range paths {
+				p.close()
+			}
 			return nil, fmt.Errorf("invalid server public key: %w", err)
 		}
 		ns, ePub, err := NewClientNoiseSession(pk)
 		if err != nil {
 			cancel()
+			for _, p := range paths {
+				p.close()
+			}
 			return nil, fmt.Errorf("create noise session failed: %w", err)
 		}
 		t.noiseSession = ns
@@ -269,6 +303,9 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 		}
 		if hsErr != nil {
 			cancel()
+			for _, p := range paths {
+				p.close()
+			}
 			return nil, fmt.Errorf("noise handshake exchange failed: %w", hsErr)
 		}
 		zlog.Infof("🔐 Established Noise_NK encryption session with server")
@@ -521,20 +558,38 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 			}
 			t.recvNext = skipTo
 		}
-		var out []byte
+		delivered := 0
 		if seqLess(serverSeq, t.recvNext) {
 			// duplicate, already delivered in order
 		} else if serverSeq == t.recvNext {
-			out = append(out, payload...)
+			// Keep recvMu held until every newly contiguous chunk has been appended
+			// to inBuf. Releasing it first lets a later response win inMu and
+			// reverses two otherwise correctly reassembled chunks.
+			t.inMu.Lock()
+			n, _ := t.inBuf.Write(payload)
+			delivered += n
 			t.recvNext++
+			for {
+				chunk, exists := t.recvOOO[t.recvNext]
+				if !exists {
+					break
+				}
+				n, _ = t.inBuf.Write(chunk)
+				delivered += n
+				delete(t.recvOOO, t.recvNext)
+				t.recvNext++
+			}
+			if delivered > 0 && t.inCond != nil {
+				t.inCond.Broadcast()
+			}
+			t.inMu.Unlock()
 		} else if _, exists := t.recvOOO[serverSeq]; !exists {
 			t.recvOOO[serverSeq] = append([]byte(nil), payload...)
 		}
-		out = append(out, t.drainRecvOOO()...)
 		atomic.StoreUint32(&t.ack, t.recvNext-1)
 		t.recvMu.Unlock()
 
-		return t.writeInBuf(out)
+		return delivered
 	}
 
 	// Non-TXT: best-effort delivery.
@@ -572,26 +627,17 @@ func (t *DNSClientTunnel) pendingDownstream() int {
 	return t.inBuf.Len()
 }
 
-// drainRecvOOO returns the contiguous run of buffered chunks starting at recvNext.
-// Caller must hold t.recvMu.
-func (t *DNSClientTunnel) drainRecvOOO() []byte {
-	var out []byte
-	for {
-		c, ok := t.recvOOO[t.recvNext]
-		if !ok {
-			return out
-		}
-		out = append(out, c...)
-		delete(t.recvOOO, t.recvNext)
-		t.recvNext++
-	}
-}
-
 // pollLoop keeps one upstream path busy: it polls, hands any answer to the reassembly,
 // and paces itself. Data-bearing polls pipeline; empty polls back off. It also pauses
 // while the reader has not drained what was already fetched, so a slow consumer cannot
 // make the tunnel hoard answers.
 func (t *DNSClientTunnel) pollLoop(idx int) {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
 	for {
 		if t.closed.Load() {
 			return
@@ -608,30 +654,55 @@ func (t *DNSClientTunnel) pollLoop(idx int) {
 		// stall a poller for a whole poll interval every time the reader happens to
 		// be a few microseconds behind.
 		if t.pendingDownstream() >= dnsTunnelDownstreamBacklog {
-			t.sleep(t.pollInterval)
+			if !t.waitTimer(timer, t.pollInterval) {
+				return
+			}
 			continue
 		}
 
 		n, err := t.sendQuery(idx, flagPoll, nil, 0)
+		delay := t.pollInterval
 		switch {
 		case err != nil:
 			t.markPathFailed(idx)
-			t.sleep(t.pollInterval)
 		case n > 0:
 			t.markPathHealthy(idx)
-			t.sleep(dnsTunnelPollBusyInterval)
+			delay = dnsTunnelPollBusyInterval
 		default:
 			t.markPathHealthy(idx)
-			t.sleep(t.pollInterval)
+		}
+		if !t.waitTimer(timer, delay) {
+			return
 		}
 	}
 }
 
-func (t *DNSClientTunnel) sleep(d time.Duration) {
+// waitTimer reuses the poller's timer instead of allocating a time.After timer
+// after every response (up to one thousand times per second on a busy path).
+func (t *DNSClientTunnel) waitTimer(timer *time.Timer, d time.Duration) bool {
+	timer.Reset(d)
 	select {
 	case <-t.ctx.Done():
 	case <-t.closeCh:
-	case <-time.After(d):
+	case <-timer.C:
+		return true
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	return false
+}
+
+func (t *DNSClientTunnel) sleep(d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-t.ctx.Done():
+	case <-t.closeCh:
+	case <-timer.C:
 	}
 }
 
@@ -664,12 +735,19 @@ func (t *DNSClientTunnel) Read(p []byte) (int, error) {
 }
 
 func (t *DNSClientTunnel) Write(p []byte) (int, error) {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
 	if t.closed.Load() {
 		return 0, net.ErrClosed
 	}
 	total := len(p)
+	if total == 0 {
+		return 0, nil
+	}
 
 	type chunkJob struct {
+		idx  int
 		seq  uint32
 		data []byte
 	}
@@ -679,7 +757,7 @@ func (t *DNSClientTunnel) Write(p []byte) (int, error) {
 		if n > t.chunkSize {
 			n = t.chunkSize
 		}
-		jobs = append(jobs, chunkJob{seq: atomic.AddUint32(&t.dataSeq, 1), data: p[:n]})
+		jobs = append(jobs, chunkJob{idx: len(jobs), seq: atomic.AddUint32(&t.dataSeq, 1), data: p[:n]})
 		p = p[n:]
 	}
 
@@ -703,7 +781,7 @@ func (t *DNSClientTunnel) Write(p []byte) (int, error) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
-	var sentBytes int
+	completed := make([]bool, len(jobs))
 
 	for i := 0; i < win; i++ {
 		wg.Add(1)
@@ -727,14 +805,24 @@ func (t *DNSClientTunnel) Write(p []byte) (int, error) {
 					return
 				}
 				mu.Lock()
-				sentBytes += len(job.data)
+				completed[job.idx] = true
 				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
 
+	sentBytes := 0
+	for i, ok := range completed {
+		if !ok {
+			break
+		}
+		sentBytes += len(jobs[i].data)
+	}
 	if firstErr != nil {
+		// A permanently missing sequence would block every later write in the
+		// server's reorder buffer, so the stream cannot be safely reused.
+		_ = t.Close()
 		return sentBytes, firstErr
 	}
 	return total, nil
@@ -804,7 +892,9 @@ func (t *DNSClientTunnel) sendCloseSignal() {
 
 	// Send on the detached context through a throwaway path so it still goes out
 	// after the tunnel's own context is cancelled.
-	_, _ = newDNSPath(t.servers[t.nextServer()]).exchange(ctx, m)
+	path := newDNSPath(t.servers[t.nextServer()])
+	defer path.close()
+	_, _ = path.exchange(ctx, m)
 }
 
 func runClient(ctx context.Context, cfg ClientConfig) {

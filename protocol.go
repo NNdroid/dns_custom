@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -74,6 +75,11 @@ func seqLess(a, b uint32) bool { return int32(a-b) < 0 }
 
 var dnsTunnelB32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
+var queryNameBufferPool = sync.Pool{New: func() any {
+	buf := make([]byte, 0, 256)
+	return &buf
+}}
+
 func dnsTypeToQType(t string) (uint16, error) {
 	switch strings.ToLower(strings.TrimSpace(t)) {
 	case "", "txt":
@@ -129,23 +135,39 @@ func qTypeToDnsType(qtype uint16) string {
 // flag     : D/P/C (data/poll/close)
 // dataSeq  : per-data-chunk upstream ordering sequence (used for server-side dedup + in-order reassembly)
 func buildQueryName(domain, session string, querySeq, ack, dataSeq uint32, flag byte, data []byte) string {
-	seqStr := strconv.FormatUint(uint64(querySeq), 10)
-	ackStr := strconv.FormatUint(uint64(ack), 10)
-	dataSeqStr := strconv.FormatUint(uint64(dataSeq), 10)
-	b32Str := "-"
-	if len(data) > 0 {
-		b32Str = dnsTunnelB32.EncodeToString(data)
+	domain = dns.Fqdn(domain)
+	encodedLen := dnsTunnelB32.EncodedLen(len(data))
+	pooled := queryNameBufferPool.Get().(*[]byte)
+	buf := (*pooled)[:0]
+	required := len(domain) + len(session) + encodedLen + 48
+	if cap(buf) < required {
+		buf = make([]byte, 0, required)
 	}
-	return strings.Join([]string{
-		seqStr,
-		ackStr,
-		string(flag),
-		dataSeqStr,
-		b32Str,
-		session,
-		dnsTunnelMarker,
-		dns.Fqdn(domain),
-	}, ".")
+	buf = strconv.AppendUint(buf, uint64(querySeq), 10)
+	buf = append(buf, '.')
+	buf = strconv.AppendUint(buf, uint64(ack), 10)
+	buf = append(buf, '.', flag, '.')
+	buf = strconv.AppendUint(buf, uint64(dataSeq), 10)
+	buf = append(buf, '.')
+	if len(data) > 0 {
+		start := len(buf)
+		buf = append(buf, make([]byte, encodedLen)...)
+		dnsTunnelB32.Encode(buf[start:], data)
+	} else {
+		buf = append(buf, '-')
+	}
+	buf = append(buf, '.')
+	buf = append(buf, session...)
+	buf = append(buf, '.')
+	buf = append(buf, dnsTunnelMarker...)
+	buf = append(buf, '.')
+	buf = append(buf, domain...)
+	name := string(buf)
+	if cap(buf) <= 512 {
+		*pooled = buf[:0]
+		queryNameBufferPool.Put(pooled)
+	}
+	return name
 }
 
 // Downstream framing for the reliable-ordered TXT transport:
@@ -202,10 +224,21 @@ func fitDownstreamPayload(qname string, n int, qtype uint16) int {
 	// Header (12) + question (name + 4) + answer header (name echoed + 10).
 	fixed := 12 + (len(qname) + 2) + 4 + (len(qname) + 2) + 10
 	budget := dnsTunnelMaxUDPResponse - fixed
-	for n > 0 && encodedRdataSize(n, qtype) > budget {
-		n--
+	if budget <= 0 {
+		return 0
 	}
-	return n
+	// encodedRdataSize is monotonic. Binary search avoids up to 200 iterations
+	// on every response in the server's hottest path.
+	low, high := 0, n
+	for low < high {
+		mid := low + (high-low+1)/2
+		if encodedRdataSize(mid, qtype) <= budget {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return low
 }
 
 // maxDownstreamPayload is the largest plaintext payload one answer may carry: the
@@ -278,36 +311,56 @@ func decodeDownstreamFrame(buf []byte) (serverSeq, skipTo uint32, payload []byte
 }
 
 func parseQueryName(domain, name string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
+	return parseQueryNameForDomain(domain, len(dns.SplitDomainName(domain)), name)
+}
+
+func parseQueryNameForDomain(domain string, domainLabelCount int, name string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
+	domain = dns.Fqdn(domain)
+	if len(name) <= len(domain) || !strings.EqualFold(name[len(name)-len(domain):], domain) {
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("query name %q is outside tunnel domain %q", name, domain)
+	}
+	domainStart := len(name) - len(domain)
+	if domainStart == 0 || name[domainStart-1] != '.' {
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("query name %q is outside tunnel domain %q", name, domain)
+	}
 	labels := dns.SplitDomainName(name)
-	domainLabels := dns.SplitDomainName(domain)
-	if len(labels) < 6+len(domainLabels)+1 {
+	if len(labels) < 6+domainLabelCount+1 {
 		return "", 0, 0, 0, 0, nil, fmt.Errorf("malformed query name %q", name)
 	}
-	markerIndex := len(labels) - len(domainLabels) - 1
+	markerIndex := len(labels) - domainLabelCount - 1
 	if markerIndex < 6 || !strings.EqualFold(labels[markerIndex], dnsTunnelMarker) {
 		return "", 0, 0, 0, 0, nil, fmt.Errorf("tunnel marker not found in %q", name)
 	}
 	session = labels[markerIndex-1]
 	b32Str := labels[markerIndex-2]
-	if flagStr := labels[markerIndex-4]; len(flagStr) > 0 {
+	if flagStr := labels[markerIndex-4]; len(flagStr) == 1 {
 		flag = flagStr[0]
 	} else {
-		return "", 0, 0, 0, 0, nil, fmt.Errorf("empty flag in %q", name)
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("invalid flag in %q", name)
 	}
-	if ds, e := strconv.ParseUint(labels[markerIndex-3], 10, 32); e == nil {
-		dataSeq = uint32(ds)
+	if flag != flagData && flag != flagPoll && flag != flagClose {
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("unsupported flag %q in %q", flag, name)
 	}
-	if ak, e := strconv.ParseUint(labels[markerIndex-5], 10, 32); e == nil {
-		ack = uint32(ak)
+	ds, e := strconv.ParseUint(labels[markerIndex-3], 10, 32)
+	if e != nil {
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("bad data sequence in %q: %w", name, e)
 	}
+	dataSeq = uint32(ds)
+	ak, e := strconv.ParseUint(labels[markerIndex-5], 10, 32)
+	if e != nil {
+		return "", 0, 0, 0, 0, nil, fmt.Errorf("bad acknowledgement in %q: %w", name, e)
+	}
+	ack = uint32(ak)
 	seqU, perr := strconv.ParseUint(labels[markerIndex-6], 10, 32)
 	if perr != nil {
 		return "", 0, 0, 0, 0, nil, fmt.Errorf("bad seq in %q: %w", name, perr)
 	}
 	querySeq = uint32(seqU)
-	data, derr := dnsTunnelB32.DecodeString(strings.ToLower(b32Str))
-	if derr != nil {
-		data = nil
+	if b32Str != "-" {
+		data, err = dnsTunnelB32.DecodeString(strings.ToLower(b32Str))
+		if err != nil {
+			return "", 0, 0, 0, 0, nil, fmt.Errorf("bad payload in %q: %w", name, err)
+		}
 	}
 	return session, querySeq, ack, dataSeq, flag, data, nil
 }

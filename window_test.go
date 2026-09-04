@@ -51,12 +51,8 @@ func benchmarkLatencyThroughput(b *testing.B, paths int, rtt time.Duration) {
 	}()
 
 	domain := fmt.Sprintf("tunnel.latbench%d.local", paths)
-	dnsAddr := fmt.Sprintf("127.0.0.1:2968%d", paths)
-	srv := NewDNSServer(ServerConfig{ListenAddr: dnsAddr, Domain: domain, TargetAddr: echoLn.Addr().String()})
-	udpServer := &dns.Server{Addr: dnsAddr, Net: "udp", Handler: latencyHandler{inner: srv, d: rtt}}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-	time.Sleep(100 * time.Millisecond)
+	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	dnsAddr := startTestDNSServer(b, latencyHandler{inner: srv, d: rtt})
 
 	servers := make([]string, 0, paths)
 	for i := 0; i < paths; i++ {
@@ -127,12 +123,8 @@ func TestTransferOverLatencyPath(t *testing.T) {
 	}()
 
 	domain := "tunnel.latency.local"
-	dnsAddr := "127.0.0.1:29560"
-	srv := NewDNSServer(ServerConfig{ListenAddr: dnsAddr, Domain: domain, TargetAddr: echoLn.Addr().String()})
-	udpServer := &dns.Server{Addr: dnsAddr, Net: "udp", Handler: latencyHandler{inner: srv, d: 20 * time.Millisecond}}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-	time.Sleep(100 * time.Millisecond)
+	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	dnsAddr := startTestDNSServer(t, latencyHandler{inner: srv, d: 20 * time.Millisecond})
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsAddr}, domain, "txt", "")
 	if err != nil {

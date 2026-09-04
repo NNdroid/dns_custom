@@ -14,6 +14,8 @@ import (
 	"github.com/miekg/dns"
 )
 
+const dnsTunnelServerBufferLimit = 512 * 1024
+
 type ServerConfig struct {
 	ListenAddr string `json:"listen"`
 	TargetAddr string `json:"target"`
@@ -23,12 +25,13 @@ type ServerConfig struct {
 }
 
 type DNSServer struct {
-	cfg        ServerConfig
-	domain     string
-	sessions   map[string]*dnsSession
-	mu         sync.RWMutex
-	privKey    [32]byte
-	hasPrivKey bool
+	cfg          ServerConfig
+	domain       string
+	domainLabels int
+	sessions     map[string]*dnsSession
+	mu           sync.RWMutex
+	privKey      [32]byte
+	hasPrivKey   bool
 }
 
 type dnsSession struct {
@@ -42,7 +45,8 @@ type dnsSession struct {
 	serverBuf     *bytes.Buffer
 	mu            sync.Mutex
 	readCond      *sync.Cond
-	pumpWaiting   bool // true while the backend pump is blocked in readCond.Wait
+	serverCond    *sync.Cond // wakes a backend reader when downstream buffer space is freed
+	pumpWaiting   bool       // true while the backend pump is blocked in readCond.Wait
 	lastActive    int64
 	closed        bool
 	closeOnce     sync.Once
@@ -80,6 +84,7 @@ func newDnsSession(sessionID, targetNetwork, targetAddr string, noiseSess *Noise
 		serverOut:     make(map[uint32]*downstreamChunk),
 	}
 	sess.readCond = sync.NewCond(&sess.mu)
+	sess.serverCond = sync.NewCond(&sess.mu)
 	return sess
 }
 
@@ -92,6 +97,17 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 	defer s.mu.Unlock()
 	if s.closed || len(data) == 0 {
 		return
+	}
+	// Reject duplicates before paying for AEAD verification. A retried Noise
+	// handshake is the common case here: its 32-byte ephemeral key is not an
+	// application ciphertext and should simply be ignored once seq was accepted.
+	if seqLess(seq, s.clientNext) {
+		return
+	}
+	if seq != s.clientNext {
+		if _, exists := s.clientOOO[seq]; exists {
+			return
+		}
 	}
 	payload := data
 	if s.noiseSession != nil && s.noiseSession.RecvCipher != nil {
@@ -108,9 +124,6 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 
 	// Reliable-ordered reassembly: drop duplicates, buffer out-of-order chunks,
 	// and deliver to the backend strictly in dataSeq order.
-	if seqLess(seq, s.clientNext) {
-		return // duplicate, already delivered in order
-	}
 	if seq == s.clientNext {
 		s.clientBuf.Write(payload)
 		s.clientNext++
@@ -128,7 +141,7 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 			s.clientOOO[seq] = append([]byte(nil), payload...)
 		}
 	}
-	s.lastActive = time.Now().Unix()
+	atomic.StoreInt64(&s.lastActive, time.Now().Unix())
 	// Wake the backend pump only when it is actually parked. Broadcasting on every
 	// chunk makes each concurrent upstream query pay for a futex wakeup plus the
 	// mutex handoff that follows, which is what capped throughput once several
@@ -136,6 +149,26 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 	if s.pumpWaiting {
 		s.readCond.Broadcast()
 	}
+}
+
+// pushServer appends bytes read from the backend while applying bounded
+// backpressure. A condition variable avoids the old 10 ms polling loop, reducing
+// latency and scheduler wakeups when a slow DNS client catches up.
+func (s *dnsSession) pushServer(data []byte) bool {
+	if len(data) == 0 {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.serverBuf.Len()+len(data) > dnsTunnelServerBufferLimit && s.serverBuf.Len() > 0 && !s.closed {
+		s.serverCond.Wait()
+	}
+	if s.closed {
+		return false
+	}
+	_, _ = s.serverBuf.Write(data)
+	atomic.StoreInt64(&s.lastActive, time.Now().Unix())
+	return true
 }
 
 // waitForClientData blocks the backend pump until upstream data arrives or the session
@@ -235,6 +268,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qname string) []byte {
 		}
 		out := make([]byte, avail)
 		_, _ = s.serverBuf.Read(out)
+		s.serverCond.Signal()
 		seq := s.serverNext
 		s.serverNext++
 		s.serverOut[seq] = &downstreamChunk{
@@ -268,7 +302,8 @@ func (s *dnsSession) popServerNow(max int, noise bool) []byte {
 	}
 	out := make([]byte, avail)
 	_, _ = s.serverBuf.Read(out)
-	s.lastActive = time.Now().Unix()
+	s.serverCond.Signal()
+	atomic.StoreInt64(&s.lastActive, time.Now().Unix())
 
 	if !noise {
 		return out
@@ -293,6 +328,7 @@ func (s *dnsSession) close() {
 			_ = s.udpConn.Close()
 		}
 		s.readCond.Broadcast()
+		s.serverCond.Broadcast()
 		s.mu.Unlock()
 	})
 }
@@ -310,9 +346,10 @@ func parseTargetNetworkAndAddr(raw string) (network, addr string) {
 
 func NewDNSServer(cfg ServerConfig) *DNSServer {
 	srv := &DNSServer{
-		cfg:      cfg,
-		domain:   dns.Fqdn(cfg.Domain),
-		sessions: make(map[string]*dnsSession),
+		cfg:          cfg,
+		domain:       dns.Fqdn(cfg.Domain),
+		domainLabels: len(dns.SplitDomainName(cfg.Domain)),
+		sessions:     make(map[string]*dnsSession),
 	}
 	if cfg.PrivateKey != "" {
 		k, err := ParseNoiseKey(cfg.PrivateKey)
@@ -327,14 +364,21 @@ func NewDNSServer(cfg ServerConfig) *DNSServer {
 	return srv
 }
 
-func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData []byte) (*dnsSession, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData []byte, allowCreate bool) (*dnsSession, bool) {
+	s.mu.RLock()
 	if sess, ok := s.sessions[sessionID]; ok {
+		s.mu.RUnlock()
 		sess.updateActive()
 		return sess, false
 	}
+	s.mu.RUnlock()
+	if !allowCreate {
+		return nil, false
+	}
 
+	// Key derivation is intentionally outside the global sessions lock. A new
+	// Noise handshake is relatively expensive and must not stall unrelated
+	// sessions that only need a map lookup.
 	targetNet, targetAddr := parseTargetNetworkAndAddr(s.cfg.TargetAddr)
 	var noiseSess *NoiseSession
 	var initialPayload []byte
@@ -357,15 +401,27 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 	}
 
 	sess := newDnsSession(sessionID, targetNet, targetAddr, noiseSess)
-	s.sessions[sessionID] = sess
-	zlog.Infof("[%s] 🆕 Created session -> Target: [%s] %s", sessionID, targetNet, targetAddr)
 
 	if s.hasPrivKey {
 		sess.pushClient(seq, initialPayload)
 		// The handshake query used this dataSeq, so the next upstream data chunk is
 		// expected at dataSeq+1 regardless of whether the handshake carried a payload.
+		sess.mu.Lock()
 		sess.clientNext = seq + 1
+		sess.mu.Unlock()
 	}
+
+	// Two first packets for the same ID may derive candidates concurrently.
+	// Publish only one and discard the other before either starts a backend.
+	s.mu.Lock()
+	if existing, ok := s.sessions[sessionID]; ok {
+		s.mu.Unlock()
+		existing.updateActive()
+		return existing, false
+	}
+	s.sessions[sessionID] = sess
+	s.mu.Unlock()
+	zlog.Infof("[%s] 🆕 Created session -> Target: [%s] %s", sessionID, targetNet, targetAddr)
 
 	go s.startBackendForwarder(sess)
 	return sess, true
@@ -415,10 +471,9 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 			for {
 				n, err := conn.Read(buf)
 				if n > 0 {
-					sess.mu.Lock()
-					sess.serverBuf.Write(buf[:n])
-					sess.lastActive = time.Now().Unix()
-					sess.mu.Unlock()
+					if !sess.pushServer(buf[:n]) {
+						return
+					}
 				}
 				if err != nil {
 					return
@@ -470,17 +525,9 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
-				sess.mu.Lock()
-				for sess.serverBuf.Len() > 512*1024 && !sess.closed {
-					sess.mu.Unlock()
-					time.Sleep(10 * time.Millisecond)
-					sess.mu.Lock()
+				if !sess.pushServer(buf[:n]) {
+					return
 				}
-				if !sess.closed {
-					sess.serverBuf.Write(buf[:n])
-					sess.lastActive = time.Now().Unix()
-				}
-				sess.mu.Unlock()
 			}
 			if err != nil {
 				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
@@ -500,7 +547,7 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 	q := req.Question[0]
-	sessionID, _, ack, dataSeq, flag, data, err := parseQueryName(s.domain, q.Name)
+	sessionID, _, ack, dataSeq, flag, data, err := parseQueryNameForDomain(s.domain, s.domainLabels, q.Name)
 	if err != nil {
 		zlog.Debugf("Non-tunnel query or parse failed: %s (%v)", q.Name, err)
 		reply.SetRcode(req, dns.RcodeNameError)
@@ -508,7 +555,9 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	sess, isNew := s.getOrCreateSession(sessionID, dataSeq, data)
+	// Poll and close queries for an unknown ID must not allocate a session or
+	// dial the configured backend. Only a data packet can establish state.
+	sess, isNew := s.getOrCreateSession(sessionID, dataSeq, data, flag == flagData && len(data) > 0)
 	if sess == nil {
 		reply.SetRcode(req, dns.RcodeNameError)
 		_ = w.WriteMsg(reply)
@@ -523,10 +572,12 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	} else if flag == flagClose {
 		zlog.Infof("[%s] Received client close signal", sessionID)
-		sess.close()
 		s.mu.Lock()
-		delete(s.sessions, sessionID)
+		if s.sessions[sessionID] == sess {
+			delete(s.sessions, sessionID)
+		}
 		s.mu.Unlock()
+		sess.close()
 	}
 
 	// Release downstream chunks the client has confirmed receiving (drives retransmit buffer).
@@ -559,15 +610,19 @@ func (s *DNSServer) cleanupLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now().Unix()
+			var stale []*dnsSession
 			s.mu.Lock()
 			for id, sess := range s.sessions {
 				if now-atomic.LoadInt64(&sess.lastActive) > 120 {
 					zlog.Infof("[%s] Session inactive for > 120s, cleaning up", id)
-					sess.close()
 					delete(s.sessions, id)
+					stale = append(stale, sess)
 				}
 			}
 			s.mu.Unlock()
+			for _, sess := range stale {
+				sess.close()
+			}
 		}
 	}
 }

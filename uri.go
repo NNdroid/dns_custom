@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 )
 
@@ -66,10 +67,7 @@ func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin strin
 	}
 
 	// 2. Direct Protocol URI (plaintext, for non-Stun clients)
-	protoURI := fmt.Sprintf("dnsc://%s?servers=%s&type=%s", domain, servers, recordType)
-	if rawPub != "" {
-		protoURI += "&pubkey=" + rawPub
-	}
+	protoURI := generateDirectProtocolURI(domain, rawPub, servers, recordType)
 
 	fmt.Printf("\n[1] Official Stun Sharing Link (stun://, encrypted):\n  %s\n", stunURI)
 	if pin == "" {
@@ -80,6 +78,16 @@ func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin strin
 	fmt.Printf("\n[2] Direct Protocol URI (plaintext):\n  %s\n\n", protoURI)
 
 	return stunURI
+}
+
+func generateDirectProtocolURI(domain, pubKey, servers, recordType string) string {
+	query := make(url.Values, 3)
+	query.Set("servers", servers)
+	query.Set("type", recordType)
+	if pubKey != "" {
+		query.Set("pubkey", pubKey)
+	}
+	return (&url.URL{Scheme: "dnsc", Host: domain, RawQuery: query.Encode()}).String()
 }
 
 func PrintTerminalQR(text string) {

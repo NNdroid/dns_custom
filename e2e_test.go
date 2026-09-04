@@ -7,9 +7,6 @@ import (
 	"io"
 	"net"
 	"testing"
-	"time"
-
-	"github.com/miekg/dns"
 )
 
 func TestDNSCustom_Plain_E2E(t *testing.T) {
@@ -37,19 +34,11 @@ func TestDNSCustom_Plain_E2E(t *testing.T) {
 	}()
 
 	domain := "tunnel.plain.local"
-	dnsServerAddr := "127.0.0.1:29541"
-
 	srv := NewDNSServer(ServerConfig{
-		ListenAddr: dnsServerAddr,
 		Domain:     domain,
 		TargetAddr: echoAddr,
 	})
-
-	udpServer := &dns.Server{Addr: dnsServerAddr, Net: "udp", Handler: srv}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-
-	time.Sleep(100 * time.Millisecond)
+	dnsServerAddr := startTestDNSServer(t, srv)
 
 	recordTypes := []string{"txt", "null", "cname", "a", "aaaa", "mx", "srv", "ns"}
 
@@ -119,20 +108,12 @@ func TestDNSCustom_Noise_Encrypted_E2E(t *testing.T) {
 	pubHex, _ := FormatNoiseKey(kp.PublicKey)
 
 	domain := "tunnel.noise.local"
-	dnsServerAddr := "127.0.0.1:29542"
-
 	srv := NewDNSServer(ServerConfig{
-		ListenAddr: dnsServerAddr,
 		Domain:     domain,
 		TargetAddr: echoAddr,
 		PrivateKey: privHex,
 	})
-
-	udpServer := &dns.Server{Addr: dnsServerAddr, Net: "udp", Handler: srv}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-
-	time.Sleep(100 * time.Millisecond)
+	dnsServerAddr := startTestDNSServer(t, srv)
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsServerAddr}, domain, "txt", pubHex)
 	if err != nil {
@@ -179,19 +160,11 @@ func TestDNSCustom_UDPTarget_E2E(t *testing.T) {
 	}()
 
 	domain := "tunnel.udptarget.local"
-	dnsServerAddr := "127.0.0.1:29543"
-
 	srv := NewDNSServer(ServerConfig{
-		ListenAddr: dnsServerAddr,
 		Domain:     domain,
 		TargetAddr: "udp://" + udpEchoAddr,
 	})
-
-	udpServer := &dns.Server{Addr: dnsServerAddr, Net: "udp", Handler: srv}
-	go func() { _ = udpServer.ListenAndServe() }()
-	defer udpServer.Shutdown()
-
-	time.Sleep(100 * time.Millisecond)
+	dnsServerAddr := startTestDNSServer(t, srv)
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsServerAddr}, domain, "txt", "")
 	if err != nil {
