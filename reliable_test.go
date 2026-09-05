@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -12,7 +12,7 @@ import (
 // TestServerUpstreamReassembly verifies the server dedups duplicates and delivers
 // out-of-order upstream chunks strictly in dataSeq order to the backend.
 func TestServerUpstreamReassembly(t *testing.T) {
-	sess := newDnsSession("test", "tcp", "127.0.0.1:1", nil)
+	sess := newDnsSession("test", "tcp", "127.0.0.1:1", false, nil, nopLogger)
 	// newDnsSession starts clientNext=1, so the first data chunk is dataSeq=1.
 
 	// Deliver out of order, then a duplicate of an already-delivered chunk.
@@ -79,18 +79,18 @@ const testPollQName = "1.0.P.0.-.0123456789abcdef.tunnel.test.local"
 // retransmitted, but once it ages past the give-up window it is abandoned and the
 // server tells the client to skip forward instead of blocking the stream forever.
 func TestServerDownstreamRetransmitThenGiveUp(t *testing.T) {
-	sess := newDnsSession("test", "tcp", "127.0.0.1:1", nil)
+	sess := newDnsSession("test", "tcp", "127.0.0.1:1", false, nil, nopLogger)
 	sess.serverBuf.WriteString("AAAA")
 
 	// First serve: seq=1, retained in serverOut pending the client's ACK.
-	first := sess.serveDownstream(dns.TypeTXT, testPollQName)
+	first := sess.serveDownstream(dns.TypeTXT, testPollQName, dnsTunnelMaxUDPResponse)
 	s1, skip1, p1, ok := decodeDownstreamFrame(first)
 	if !ok || s1 != 1 || skip1 != 0 || string(p1) != "AAAA" {
 		t.Fatalf("first frame mismatch: seq=%d skipTo=%d payload=%q ok=%v", s1, skip1, p1, ok)
 	}
 
 	// Still unacked: the same chunk must be retransmitted.
-	again := sess.serveDownstream(dns.TypeTXT, testPollQName)
+	again := sess.serveDownstream(dns.TypeTXT, testPollQName, dnsTunnelMaxUDPResponse)
 	s2, skip2, p2, _ := decodeDownstreamFrame(again)
 	if s2 != 1 || skip2 != 0 || string(p2) != "AAAA" {
 		t.Fatalf("expected retransmit of seq 1, got seq=%d skipTo=%d payload=%q", s2, skip2, p2)
@@ -100,7 +100,7 @@ func TestServerDownstreamRetransmitThenGiveUp(t *testing.T) {
 	sess.serverOut[1].firstSent = time.Now().Add(-dnsTunnelDownstreamGiveUp - time.Second)
 	sess.serverBuf.WriteString("BBBB")
 
-	third := sess.serveDownstream(dns.TypeTXT, testPollQName)
+	third := sess.serveDownstream(dns.TypeTXT, testPollQName, dnsTunnelMaxUDPResponse)
 	s3, skip3, p3, _ := decodeDownstreamFrame(third)
 	if s3 != 2 || skip3 != 2 || string(p3) != "BBBB" {
 		t.Fatalf("after give-up expected seq=2 skipTo=2 payload=%q, got seq=%d skipTo=%d payload=%q", "BBBB", s3, skip3, p3)

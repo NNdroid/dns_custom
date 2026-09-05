@@ -27,6 +27,9 @@ func runGenSystemd(args []string) {
   "mode": "server",
   "listen": %q,
   "target": %q,
+  "allow_targets": [],
+  "max_sessions": 0,
+  "edns0": false,
   "domain": %q,
   "privkey": %q,
   "log_level": "info"

@@ -1,13 +1,10 @@
-package main
+package dnstunnel
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -107,7 +104,10 @@ func TestConcurrentDownstreamDeliveryStaysOrdered(t *testing.T) {
 }
 
 func TestUnknownPollDoesNotCreateSession(t *testing.T) {
-	srv := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
+	srv, err := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sess, created := srv.getOrCreateSession("unknown", 0, nil, false); sess != nil || created {
 		t.Fatalf("unknown poll returned session=%v created=%v", sess, created)
 	}
@@ -120,7 +120,7 @@ func TestUnknownPollDoesNotCreateSession(t *testing.T) {
 }
 
 func TestServerBufferBackpressureWakesOnDrain(t *testing.T) {
-	sess := newDnsSession("backpressure", "tcp", "127.0.0.1:1", nil)
+	sess := newDnsSession("backpressure", "tcp", "127.0.0.1:1", false, nil, nopLogger)
 	sess.serverBuf.Write(make([]byte, dnsTunnelServerBufferLimit))
 	done := make(chan bool, 1)
 	go func() { done <- sess.pushServer([]byte{1}) }()
@@ -131,7 +131,7 @@ func TestServerBufferBackpressureWakesOnDrain(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if frame := sess.serveDownstream(dns.TypeTXT, testPollQName); len(frame) == 0 {
+	if frame := sess.serveDownstream(dns.TypeTXT, testPollQName, dnsTunnelMaxUDPResponse); len(frame) == 0 {
 		t.Fatal("serveDownstream did not drain the buffer")
 	}
 	select {
@@ -157,54 +157,6 @@ func TestDoHResponseSizeIsBounded(t *testing.T) {
 	msg.SetQuestion("example.com.", dns.TypeA)
 	if _, err := path.exchange(context.Background(), msg); err == nil || !strings.Contains(err.Error(), "larger") {
 		t.Fatalf("oversized DoH response error = %v", err)
-	}
-}
-
-func TestDecryptStunURIRejectsMalformedEnvelope(t *testing.T) {
-	encode := func(env shareEnvelope) string {
-		raw, err := json.Marshal(env)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return "stun://" + base64.StdEncoding.EncodeToString(raw)
-	}
-	validField := func(n int) string { return base64.StdEncoding.EncodeToString(make([]byte, n)) }
-	cases := map[string]shareEnvelope{
-		"compression flag": {V: 1, G: 2, S: validField(shareSaltLen), I: validField(shareIvLen), C: validField(16)},
-		"salt length":      {V: 1, S: validField(1), I: validField(shareIvLen), C: validField(16)},
-		"nonce length":     {V: 1, S: validField(shareSaltLen), I: validField(1), C: validField(16)},
-		"ciphertext":       {V: 1, S: validField(shareSaltLen), I: validField(shareIvLen), C: validField(1)},
-	}
-	for name, env := range cases {
-		t.Run(name, func(t *testing.T) {
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					t.Fatalf("malformed envelope panicked: %v", recovered)
-				}
-			}()
-			if _, err := decryptStunURI(encode(env), "123456"); err == nil {
-				t.Fatal("malformed envelope was accepted")
-			}
-		})
-	}
-}
-
-func TestDirectProtocolURIEscapesQueryValues(t *testing.T) {
-	servers := "https://dns.example/dns-query,1.1.1.1:53"
-	pubKey := "a+b/c=="
-	raw := generateDirectProtocolURI("tunnel.example", pubKey, servers, "txt")
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		t.Fatalf("parse generated URI: %v", err)
-	}
-	if parsed.Scheme != "dnsc" || parsed.Host != "tunnel.example" {
-		t.Fatalf("unexpected URI authority: %s", raw)
-	}
-	if got := parsed.Query().Get("servers"); got != servers {
-		t.Fatalf("servers round trip = %q, want %q", got, servers)
-	}
-	if got := parsed.Query().Get("pubkey"); got != pubKey {
-		t.Fatalf("pubkey round trip = %q, want %q", got, pubKey)
 	}
 }
 

@@ -75,7 +75,7 @@ install_binary() {
     echo -e "${CYAN}--> Building from source with Go...${PLAIN}"
     local source_version
     source_version="v1.0.$(date -u +%Y%m%d)-$(git rev-parse --short=7 HEAD 2>/dev/null || printf 'local')"
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${source_version}" -o "${INSTALL_DIR}/${APP_NAME}" .
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/NNdroid/dns_custom.Version=${source_version}" -o "${INSTALL_DIR}/${APP_NAME}" ./cmd/dns_custom
   else
     echo -e "${CYAN}--> Downloading release binary (${goarch})...${PLAIN}"
     local download_url

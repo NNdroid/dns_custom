@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -34,10 +34,13 @@ func TestDNSCustom_Plain_E2E(t *testing.T) {
 	}()
 
 	domain := "tunnel.plain.local"
-	srv := NewDNSServer(ServerConfig{
+	srv, err := NewDNSServer(ServerConfig{
 		Domain:     domain,
 		TargetAddr: echoAddr,
 	})
+	if err != nil {
+		t.Fatalf("NewDNSServer failed: %v", err)
+	}
 	dnsServerAddr := startTestDNSServer(t, srv)
 
 	recordTypes := []string{"txt", "null", "cname", "a", "aaaa", "mx", "srv", "ns"}
@@ -108,11 +111,14 @@ func TestDNSCustom_Noise_Encrypted_E2E(t *testing.T) {
 	pubHex, _ := FormatNoiseKey(kp.PublicKey)
 
 	domain := "tunnel.noise.local"
-	srv := NewDNSServer(ServerConfig{
+	srv, serr := NewDNSServer(ServerConfig{
 		Domain:     domain,
 		TargetAddr: echoAddr,
 		PrivateKey: privHex,
 	})
+	if serr != nil {
+		t.Fatalf("NewDNSServer failed: %v", serr)
+	}
 	dnsServerAddr := startTestDNSServer(t, srv)
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsServerAddr}, domain, "txt", pubHex)
@@ -160,10 +166,13 @@ func TestDNSCustom_UDPTarget_E2E(t *testing.T) {
 	}()
 
 	domain := "tunnel.udptarget.local"
-	srv := NewDNSServer(ServerConfig{
+	srv, err := NewDNSServer(ServerConfig{
 		Domain:     domain,
 		TargetAddr: "udp://" + udpEchoAddr,
 	})
+	if err != nil {
+		t.Fatalf("NewDNSServer failed: %v", err)
+	}
 	dnsServerAddr := startTestDNSServer(t, srv)
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsServerAddr}, domain, "txt", "")

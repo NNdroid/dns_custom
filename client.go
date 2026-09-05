@@ -1,20 +1,24 @@
-package main
+// Client side of the DNS tunnel: dials out through upstream DNS resolvers.
+package dnstunnel
 
 import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
+	"go.uber.org/zap"
 )
 
 // dnsTunnelMaxSendAttempts is how many times one upstream chunk is re-sent before
@@ -37,6 +41,16 @@ const dnsTunnelConnPool = 32
 // an unbounded allocation in io.ReadAll.
 const maxDNSWireMessageSize = 65535
 
+// udpSessionPrefix marks a tunnel session as carrying length-framed UDP datagrams
+// instead of a raw byte stream. It lives inside the session label of the query
+// name, so the server learns the mode from the very first query without a
+// protocol change. Hex session IDs generated for stream sessions can never start
+// with "u", which keeps the two modes unambiguous on the same server.
+const udpSessionPrefix = "u"
+
+// nopLogger is the logger used when the embedder did not inject one.
+var nopLogger = zap.NewNop().Sugar()
+
 // dnsPath is one upstream resolver plus its warm socket pool. A pooled socket is owned
 // exclusively by the query that is in flight on it: a shared socket would let one
 // caller's read steal another caller's response.
@@ -51,7 +65,11 @@ type dnsPath struct {
 	closed  atomic.Bool
 }
 
-func newDNSPath(server string) *dnsPath {
+func newDNSPath(server string, dialers ...*net.Dialer) *dnsPath {
+	var dialer *net.Dialer
+	if len(dialers) > 0 {
+		dialer = dialers[0]
+	}
 	p := &dnsPath{
 		server: server,
 		pool:   make(chan *dns.Conn, dnsTunnelConnPool),
@@ -71,9 +89,12 @@ func newDNSPath(server string) *dnsPath {
 	if p.dohURL != "" {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConnsPerHost = dnsTunnelConnPool
+		if dialer != nil {
+			transport.DialContext = dialer.DialContext
+		}
 		p.httpCli = &http.Client{Transport: transport, Timeout: 4 * time.Second}
 	} else {
-		p.dnsCli = &dns.Client{Net: p.network, Timeout: 4 * time.Second}
+		p.dnsCli = &dns.Client{Net: p.network, Timeout: 4 * time.Second, Dialer: dialer}
 	}
 	return p
 }
@@ -184,24 +205,138 @@ func (p *dnsPath) exchangeDoH(ctx context.Context, m *dns.Msg) (*dns.Msg, error)
 	return reply, nil
 }
 
+// ClientConfig configures a Client. Logger may be left nil for a silent client;
+// the CLI injects its own zap logger here.
+//
+// Target optionally declares the backend the client wants sessions forwarded to
+// ("tcp://host:port" or "udp://host:port"; host:port alone means tcp). The
+// server only honors it when the target passes its allow_targets list, and the
+// server's answer tells the caller which transport actually applies (see
+// DefaultTarget and DNSClientTunnel.Transport). Leave empty to use whatever
+// default target the server is configured with.
 type ClientConfig struct {
-	ListenAddr string   `json:"listen"`
-	Domain     string   `json:"domain"`
-	Servers    []string `json:"servers"`
-	RecordType string   `json:"record_type"`
-	PublicKey  string   `json:"pubkey"`
-	LogLevel   string   `json:"log_level"`
+	Domain     string             `json:"domain"`
+	Servers    []string           `json:"servers"`
+	RecordType string             `json:"record_type"`
+	PublicKey  string             `json:"pubkey"`
+	Target     string             `json:"target,omitempty"`
+	EDNS0      bool               `json:"edns0,omitempty"`
+	Logger     *zap.SugaredLogger `json:"-"`
+	// Dialer optionally controls sockets used by UDP, TCP, DoT and DoH paths.
+	Dialer *net.Dialer `json:"-"`
 }
 
+// Client is the library entry point for dialing out through the DNS tunnel. One
+// Client can open any number of independent tunnel sessions via Dial / DialUDP.
+type Client struct {
+	servers    []string
+	domain     string
+	recordType string
+	publicKey  string
+	target     string
+	edns0      bool
+	log        *zap.SugaredLogger
+	dialer     *net.Dialer
+}
+
+// NewClient validates the configuration and returns a Client. The public key,
+// when set, is parsed once here so a typo fails at startup instead of on the
+// first dial.
+func NewClient(cfg ClientConfig) (*Client, error) {
+	if strings.TrimSpace(cfg.Domain) == "" {
+		return nil, errors.New("dnstunnel: domain is required")
+	}
+	if len(cfg.Servers) == 0 {
+		return nil, errors.New("dnstunnel: at least one upstream DNS server is required")
+	}
+	if cfg.PublicKey != "" {
+		if _, err := ParseNoiseKey(cfg.PublicKey); err != nil {
+			return nil, fmt.Errorf("dnstunnel: invalid server public key: %w", err)
+		}
+	}
+	qtype, err := dnsTypeToQType(cfg.RecordType)
+	if err != nil {
+		return nil, fmt.Errorf("dnstunnel: %w", err)
+	}
+	if cfg.PublicKey != "" && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
+		return nil, fmt.Errorf("dnstunnel: record type %q cannot carry authenticated Noise frames (A/AAAA hold 4/16 bytes); use txt/null/cname/mx/srv/ns", cfg.RecordType)
+	}
+	log := cfg.Logger
+	if log == nil {
+		log = nopLogger
+	}
+	return &Client{
+		servers:    cfg.Servers,
+		domain:     cfg.Domain,
+		recordType: cfg.RecordType,
+		publicKey:  cfg.PublicKey,
+		target:     strings.TrimSpace(cfg.Target),
+		edns0:      cfg.EDNS0,
+		log:        log,
+		dialer:     cfg.Dialer,
+	}, nil
+}
+
+// Dial opens a new tunnel session and returns it as a stream net.Conn. Each call
+// establishes an independent session (Noise handshake, target declaration,
+// pollers, adaptive window) terminated on the server's backend. When the client
+// has a declared target it must be tcp:// — datagram targets need DialUDP.
+func (c *Client) Dial(ctx context.Context) (net.Conn, error) {
+	if c.target != "" && strings.HasPrefix(c.target, "udp://") {
+		return nil, fmt.Errorf("dnstunnel: declared target %q is udp; use DialUDP", c.target)
+	}
+	return newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", c.target, c.edns0, c.log, c.dialer)
+}
+
+// DialUDP opens a new tunnel session that carries UDP datagrams to the server's
+// UDP backend. Datagrams are length-framed over the tunnel byte stream, so
+// datagram boundaries survive the trip (unlike the legacy stream mode, which
+// reassembles upstream chunks without preserving boundaries).
+//
+// When the client has a declared target it must be udp://; the declaration is
+// validated by the server's allow list. Without a declaration the session uses
+// the server's default target, which must itself be udp://.
+func (c *Client) DialUDP(ctx context.Context) (net.PacketConn, error) {
+	if c.target != "" && !strings.HasPrefix(c.target, "udp://") {
+		return nil, fmt.Errorf("dnstunnel: declared target %q is tcp; use Dial", c.target)
+	}
+	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, udpSessionPrefix, c.target, c.edns0, c.log, c.dialer)
+	if err != nil {
+		return nil, err
+	}
+	return &tunnelPacketConn{stream: t}, nil
+}
+
+// DefaultTarget asks the server which transport its default target uses ("tcp"
+// or "udp"). It opens a throwaway session, declares no target, and reads the
+// server's answer — this is how a caller that has no declared target learns
+// which local socket to bind. A server that predates target declarations (or
+// refuses the empty declaration) yields an error.
+func (c *Client) DefaultTarget(ctx context.Context) (string, error) {
+	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", "", c.edns0, c.log, c.dialer)
+	if err != nil {
+		return "", err
+	}
+	defer t.Close()
+	return t.declareTarget("")
+}
+
+// DNSClientTunnel is one tunnel session: a reliable ordered byte stream over DNS
+// queries, optionally encrypted with Noise_NK. It implements net.Conn, so it can
+// be handed directly to io.Copy, http.Transport.DialContext, database drivers
+// and anything else that consumes connections.
 type DNSClientTunnel struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	servers      []string
 	domain       string
 	qtype        uint16
+	edns0        bool
 	session      string
 	chunkSize    int
 	pollInterval time.Duration
+	log          *zap.SugaredLogger
+	dialer       *net.Dialer
 
 	paths        []*dnsPath    // one per configured upstream server
 	serverCursor uint32        // atomic; round-robin cursor over upstream servers
@@ -213,6 +348,12 @@ type DNSClientTunnel struct {
 	noiseSession *NoiseSession
 	closed       atomic.Bool
 	closeCh      chan struct{}
+
+	// Deadlines for the net.Conn interface. The blocking waits check these after
+	// every wake-up; armDeadline broadcasts the wait conditions on expiry.
+	deadlineMu    sync.Mutex
+	readDeadline  time.Time
+	writeDeadline time.Time
 
 	// Adaptive in-flight window for upstream chunks (see onWindowSample).
 	window     int32 // atomic; current total in-flight window
@@ -227,9 +368,18 @@ type DNSClientTunnel struct {
 	recvOOO  map[uint32][]byte // out-of-order downstream chunks buffered for in-order delivery
 	recvMu   sync.Mutex
 	writeMu  sync.Mutex // serializes Write calls so the byte-stream order is unambiguous
+
+	// pollKick nudges idle pollers as soon as an upstream write completes, so the
+	// server's fresh downstream data is fetched within one RTT instead of after
+	// up to a full poll interval.
+	pollKick chan struct{}
+
+	// transport is the backend transport the server confirmed for this session
+	// ("tcp"/"udp"), set by the target declaration before any data flows.
+	transport string
 }
 
-func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string) (*DNSClientTunnel, error) {
+func newDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string, sessionPrefix string, declaredTarget string, edns0 bool, log *zap.SugaredLogger, dialer *net.Dialer) (*DNSClientTunnel, error) {
 	if domain == "" || len(servers) == 0 {
 		return nil, fmt.Errorf("domain and servers are required")
 	}
@@ -239,7 +389,7 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 	}
 	paths := make([]*dnsPath, 0, len(servers))
 	for _, srv := range servers {
-		paths = append(paths, newDNSPath(srv))
+		paths = append(paths, newDNSPath(srv, dialer))
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	t := &DNSClientTunnel{
@@ -248,10 +398,14 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 		servers:      servers,
 		domain:       dns.Fqdn(domain),
 		qtype:        qtype,
-		session:      fmt.Sprintf("%x", mrand.Uint64()),
+		edns0:        edns0,
+		session:      sessionPrefix + fmt.Sprintf("%x", mrand.Uint64()),
 		chunkSize:    dnsTunnelDefaultChunk,
 		pollInterval: dnsTunnelPollInterval,
+		log:          log,
+		dialer:       dialer,
 		inBuf:        new(bytes.Buffer),
+		pollKick:     make(chan struct{}, len(paths)),
 		closeCh:      make(chan struct{}),
 		recvNext:     1,
 		recvOOO:      make(map[uint32][]byte),
@@ -308,7 +462,22 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 			}
 			return nil, fmt.Errorf("noise handshake exchange failed: %w", hsErr)
 		}
-		zlog.Infof("🔐 Established Noise_NK encryption session with server")
+		t.log.Infof("🔐 Established Noise_NK encryption session with server")
+	}
+
+	// Declare the target (if any) before the pollers and before any data: the
+	// server resolves the transport first and answers synchronously on this
+	// query, and dials its backend only once data flows.
+	if declaredTarget != "" {
+		transport, err := t.declareTarget(declaredTarget)
+		if err != nil {
+			cancel()
+			for _, p := range paths {
+				p.close()
+			}
+			return nil, err
+		}
+		t.transport = transport
 	}
 
 	// One poller per upstream server. Polls are independent, each answer carries one
@@ -323,6 +492,13 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 	return t, nil
 }
 
+// NewDNSClientTunnel opens a single stream tunnel session. Library users usually
+// want Client.Dial instead, which is this constructor behind a reusable,
+// pre-validated Client.
+func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string) (*DNSClientTunnel, error) {
+	return newDNSClientTunnel(ctx, servers, domain, recordType, pubKeyStr, "", "", false, nopLogger, nil)
+}
+
 // sendQuery sends one tunnel query to a single upstream server and feeds any answer
 // payload into the downstream reassembly. It returns the number of downstream bytes
 // that became available to Read.
@@ -330,11 +506,11 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 // Queries are no longer serialized globally: the only ordering requirement used to be
 // the AEAD nonce, and that is now derived from the sequence number carried by the
 // query/frame itself.
-func (t *DNSClientTunnel) sendQuery(pathIdx int, flag byte, wirePayload []byte, dataSeq uint32) (int, error) {
-	if t.closed.Load() {
-		return 0, net.ErrClosed
-	}
-
+// buildQuery assembles a tunnel query message for the given data sequence, flag
+// and wire payload. The query sequence doubles as the DNS transaction ID. With
+// EDNS0 enabled the query announces a 1232-byte buffer so resolvers forward the
+// server's larger answers instead of truncating them at 512.
+func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
 	seq := atomic.AddUint32(&t.seq, 1)
 	name := buildQueryName(t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
 
@@ -342,8 +518,18 @@ func (t *DNSClientTunnel) sendQuery(pathIdx int, flag byte, wirePayload []byte, 
 	m.SetQuestion(name, t.qtype)
 	m.RecursionDesired = false
 	m.Id = uint16(seq)
+	if t.edns0 {
+		m.SetEdns0(dnsTunnelEDNS0UDPSize, false)
+	}
+	return m
+}
 
-	resp, err := t.paths[pathIdx].exchange(t.ctx, m)
+func (t *DNSClientTunnel) sendQuery(pathIdx int, flag byte, wirePayload []byte, dataSeq uint32) (int, error) {
+	if t.closed.Load() {
+		return 0, net.ErrClosed
+	}
+
+	resp, err := t.paths[pathIdx].exchange(t.ctx, t.buildQuery(dataSeq, flag, wirePayload))
 	if err != nil {
 		return 0, err
 	}
@@ -416,7 +602,7 @@ func (t *DNSClientTunnel) onWindowSample(ok bool, rtt time.Duration) {
 	}
 	// The first queries include socket setup, DNS server warm-up and GC noise, so
 	// their latency says nothing about the path. Adopting one of those as the
-	// "best" RTT would make every later sample look fast and pin the window at its
+	// "best" RTT would make every later sample look fast and pin the window at the
 	// maximum, which is the exact opposite of what adaptation is for.
 	if atomic.AddInt64(&t.winSamples, 1) <= dnsTunnelWindowWarmup {
 		return
@@ -453,7 +639,7 @@ func (t *DNSClientTunnel) onWindowSample(ok bool, rtt time.Duration) {
 		return
 	}
 
-	if t.bestRTT == 0 || int64(rtt) < best {
+	if best == 0 || int64(rtt) < best {
 		atomic.StoreInt64(&t.bestRTT, int64(rtt))
 	}
 
@@ -531,7 +717,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 			// Not a framed chunk (legacy or truncated answer). Without a sequence
 			// number there is no nonce, so an authenticated chunk cannot be opened.
 			if noise {
-				zlog.Warnf("Short TXT frame (%d bytes) cannot be authenticated, dropped", len(raw))
+				t.log.Warnf("Short TXT frame (%d bytes) cannot be authenticated, dropped", len(raw))
 				return 0
 			}
 			return t.writeInBuf(raw)
@@ -541,7 +727,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 		if noise {
 			dec, err := t.noiseSession.RecvCipher.Decrypt(uint64(serverSeq), tail)
 			if err != nil {
-				zlog.Warnf("Downstream frame serverSeq=%d failed to decrypt: %v", serverSeq, err)
+				t.log.Warnf("Downstream frame serverSeq=%d failed to decrypt: %v", serverSeq, err)
 				return 0
 			}
 			payload = dec
@@ -600,7 +786,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 		seq := binary.BigEndian.Uint32(raw[:nonTxtNoiseHeaderSize])
 		dec, err := t.noiseSession.RecvCipher.Decrypt(uint64(seq), raw[nonTxtNoiseHeaderSize:])
 		if err != nil {
-			zlog.Warnf("Downstream chunk seq=%d failed to decrypt: %v", seq, err)
+			t.log.Warnf("Downstream chunk seq=%d failed to decrypt: %v", seq, err)
 			return 0
 		}
 		return t.writeInBuf(dec)
@@ -684,6 +870,8 @@ func (t *DNSClientTunnel) waitTimer(timer *time.Timer, d time.Duration) bool {
 	select {
 	case <-t.ctx.Done():
 	case <-t.closeCh:
+	case <-t.pollKick:
+		return true
 	case <-timer.C:
 		return true
 	}
@@ -694,6 +882,16 @@ func (t *DNSClientTunnel) waitTimer(timer *time.Timer, d time.Duration) bool {
 		}
 	}
 	return false
+}
+
+// kickPollers wakes one idle poller so freshly written upstream data and its
+// downstream answer are fetched within a round trip instead of after up to a
+// full poll interval. Non-blocking: tokens coalesce while pollers are busy.
+func (t *DNSClientTunnel) kickPollers() {
+	select {
+	case t.pollKick <- struct{}{}:
+	default:
+	}
 }
 
 func (t *DNSClientTunnel) sleep(d time.Duration) {
@@ -720,6 +918,9 @@ func (t *DNSClientTunnel) Read(p []byte) (int, error) {
 		case <-t.closeCh:
 			return 0, io.EOF
 		default:
+		}
+		if t.readDeadlineExceeded() {
+			return 0, os.ErrDeadlineExceeded
 		}
 
 		if t.inCond != nil {
@@ -825,6 +1026,9 @@ func (t *DNSClientTunnel) Write(p []byte) (int, error) {
 		_ = t.Close()
 		return sentBytes, firstErr
 	}
+	// The server just received fresh data and its backend reply is already on its
+	// way downstream; wake an idle poller instead of waiting out the poll interval.
+	t.kickPollers()
 	return total, nil
 }
 
@@ -842,6 +1046,9 @@ func (t *DNSClientTunnel) sendDataChunkWithRetry(chunk []byte, dataSeq uint32) e
 	for attempt := 0; attempt < dnsTunnelMaxSendAttempts; attempt++ {
 		if t.closed.Load() {
 			return net.ErrClosed
+		}
+		if t.writeDeadlineExceeded() {
+			return os.ErrDeadlineExceeded
 		}
 		idx := t.nextServer()
 		start := time.Now()
@@ -892,56 +1099,202 @@ func (t *DNSClientTunnel) sendCloseSignal() {
 
 	// Send on the detached context through a throwaway path so it still goes out
 	// after the tunnel's own context is cancelled.
-	path := newDNSPath(t.servers[t.nextServer()])
+	path := newDNSPath(t.servers[t.nextServer()], t.dialer)
 	defer path.close()
 	_, _ = path.exchange(ctx, m)
 }
 
-func runClient(ctx context.Context, cfg ClientConfig) {
-	initLogger(cfg.LogLevel)
-	defer zlog.Sync()
-
-	zlog.Infof("🚀 Starting dns_custom client v%s", Version)
-	zlog.Infof("🎧 Listening locally on TCP %s", cfg.ListenAddr)
-	zlog.Infof("🌐 Upstream DNS Servers: %v (Domain: %s, Type: %s)", cfg.Servers, cfg.Domain, cfg.RecordType)
-
-	ln, err := net.Listen("tcp", cfg.ListenAddr)
-	if err != nil {
-		zlog.Fatalf("Failed to listen on %s: %v", cfg.ListenAddr, err)
-	}
-	defer ln.Close()
-
-	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
-	}()
-
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				zlog.Errorf("Accept failed: %v", err)
-				continue
-			}
+// declareTarget sends a flag 'T' query declaring the backend this session wants
+// ("" = the server default) and returns the transport the server confirmed:
+// "tcp" or "udp". The declaration is encrypted with the reserved control
+// sequence when Noise is on, and the answer is always plaintext.
+func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
+	addr, wantUDP := "", false
+	if target != "" {
+		network, host := "tcp", target
+		if strings.HasPrefix(target, "udp://") {
+			network, host = "udp", strings.TrimPrefix(target, "udp://")
+		} else {
+			host = strings.TrimPrefix(target, "tcp://")
 		}
+		if strings.Contains(host, "://") || host == "" {
+			return "", fmt.Errorf("dnstunnel: invalid declared target %q", target)
+		}
+		addr, wantUDP = host, network == "udp"
+	}
+	payload := encodeTargetRequest(addr, wantUDP)
+	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
+		payload = t.noiseSession.SendCipher.Encrypt(uint64(dnsTunnelControlSeq), payload)
+	}
 
-		go func(conn net.Conn) {
-			defer conn.Close()
-			tunnel, err := NewDNSClientTunnel(ctx, cfg.Servers, cfg.Domain, cfg.RecordType, cfg.PublicKey)
-			if err != nil {
-				zlog.Errorf("Failed to establish DNS tunnel: %v", err)
-				return
+	var lastErr error
+	for attempt := 0; attempt < dnsTunnelTargetAttempts; attempt++ {
+		if t.closed.Load() {
+			return "", net.ErrClosed
+		}
+		idx := t.nextServer()
+		resp, err := t.paths[idx].exchange(t.ctx, t.buildQuery(dnsTunnelControlSeq, flagTarget, payload))
+		if err == nil && resp != nil {
+			for _, ans := range resp.Answer {
+				if raw := extractAnswer(ans); raw != nil {
+					status, udp, ok := decodeTargetResponse(raw)
+					if !ok {
+						continue
+					}
+					if status == targetStatusDeny {
+						return "", fmt.Errorf("dnstunnel: declared target %q denied by the server allow list", target)
+					}
+					if udp {
+						return "udp", nil
+					}
+					return "tcp", nil
+				}
 			}
-			defer tunnel.Close()
+			// A reply without a decodable answer means the server predates target
+			// declarations: it echoed an empty or legacy answer. Fall back to the
+			// legacy semantics (session marker decides, server default applies).
+			t.log.Warnf("Server did not answer the target declaration (old version?); assuming server default target")
+			return "", nil
+		}
+		lastErr = err
+		t.markPathFailed(idx)
+		t.sleep(dnsTunnelTargetBackoff * time.Duration(attempt+1))
+	}
+	return "", fmt.Errorf("dnstunnel: target declaration failed after %d attempts: %w", dnsTunnelTargetAttempts, lastErr)
+}
 
-			go func() {
-				_, _ = io.Copy(tunnel, conn)
-				_ = tunnel.Close()
-			}()
-			_, _ = io.Copy(conn, tunnel)
-		}(c)
+// Transport reports the backend transport the server confirmed for this session
+// ("tcp" or "udp"). It is set once the target declaration exchange completes;
+// sessions without a declared target learn nothing here and follow the server's
+// default.
+func (t *DNSClientTunnel) Transport() string {
+	return t.transport
+}
+
+// LocalAddr and RemoteAddr are pseudo addresses identifying this tunnel session;
+// the tunnel has no real socket-level endpoints.
+func (t *DNSClientTunnel) LocalAddr() net.Addr {
+	return tunnelAddr{network: "dnstunnel", addr: "dnstunnel:" + t.session}
+}
+
+func (t *DNSClientTunnel) RemoteAddr() net.Addr {
+	return tunnelAddr{network: "dnstunnel", addr: "dnstunnel:server"}
+}
+
+// SetDeadline sets both the read and the write deadline. A zero time disables the
+// deadline. An expired deadline unblocks pending Read/Write calls with
+// os.ErrDeadlineExceeded.
+func (t *DNSClientTunnel) SetDeadline(deadline time.Time) error {
+	if err := t.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	return t.SetWriteDeadline(deadline)
+}
+
+func (t *DNSClientTunnel) SetReadDeadline(deadline time.Time) error {
+	t.deadlineMu.Lock()
+	t.readDeadline = deadline
+	t.deadlineMu.Unlock()
+	t.armDeadline(deadline)
+	return nil
+}
+
+func (t *DNSClientTunnel) SetWriteDeadline(deadline time.Time) error {
+	t.deadlineMu.Lock()
+	t.writeDeadline = deadline
+	t.deadlineMu.Unlock()
+	t.armDeadline(deadline)
+	return nil
+}
+
+// armDeadline wakes the blocking waits once the deadline passes. Read re-checks the
+// stored deadline after every wake-up, so a broadcast is all that is needed.
+func (t *DNSClientTunnel) armDeadline(deadline time.Time) {
+	if deadline.IsZero() {
+		return
+	}
+	if delta := time.Until(deadline); delta > 0 {
+		time.AfterFunc(delta, t.wakeWaiters)
 	}
 }
+
+func (t *DNSClientTunnel) wakeWaiters() {
+	t.inMu.Lock()
+	if t.inCond != nil {
+		t.inCond.Broadcast()
+	}
+	t.inMu.Unlock()
+}
+
+func (t *DNSClientTunnel) readDeadlineExceeded() bool {
+	t.deadlineMu.Lock()
+	defer t.deadlineMu.Unlock()
+	return !t.readDeadline.IsZero() && !time.Now().Before(t.readDeadline)
+}
+
+func (t *DNSClientTunnel) writeDeadlineExceeded() bool {
+	t.deadlineMu.Lock()
+	defer t.deadlineMu.Unlock()
+	return !t.writeDeadline.IsZero() && !time.Now().Before(t.writeDeadline)
+}
+
+// tunnelAddr is the pseudo address carried by LocalAddr/RemoteAddr on the tunnel
+// conn and the packet conn.
+type tunnelAddr struct {
+	network string
+	addr    string
+}
+
+func (a tunnelAddr) Network() string { return a.network }
+func (a tunnelAddr) String() string  { return a.addr }
+
+// tunnelPacketConn adapts one tunnel session into a net.PacketConn carrying
+// length-framed UDP datagrams. Every WriteTo becomes one datagram at the server's
+// UDP backend and every datagram the backend sends becomes exactly one ReadFrom.
+type tunnelPacketConn struct {
+	stream *DNSClientTunnel
+}
+
+// packetServerAddr is reported by ReadFrom: the tunnel's backend is a single
+// connected UDP peer on the server side.
+var packetServerAddr = tunnelAddr{network: "dnstunnel", addr: "dnstunnel:server-backend"}
+
+func (c *tunnelPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	var hdr [udpFrameHeaderSize]byte
+	if _, err := io.ReadFull(c.stream, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+	if n > len(p) {
+		// Datagrams larger than the caller's buffer are truncated, matching
+		// net.UDPConn semantics: read the full frame, keep what fits.
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(c.stream, buf); err != nil {
+			return 0, nil, err
+		}
+		copy(p, buf[:len(p)])
+		return len(p), packetServerAddr, nil
+	}
+	if _, err := io.ReadFull(c.stream, p[:n]); err != nil {
+		return 0, nil, err
+	}
+	return n, packetServerAddr, nil
+}
+
+func (c *tunnelPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	if len(b) > udpFrameMaxDatagram {
+		return 0, fmt.Errorf("dnstunnel: datagram of %d bytes exceeds the %d byte frame limit", len(b), udpFrameMaxDatagram)
+	}
+	frame := encodeUDPFrame(b)
+	if _, err := c.stream.Write(frame); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (c *tunnelPacketConn) Close() error                       { return c.stream.Close() }
+func (c *tunnelPacketConn) LocalAddr() net.Addr                { return c.stream.LocalAddr() }
+func (c *tunnelPacketConn) RemoteAddr() net.Addr               { return packetServerAddr }
+func (c *tunnelPacketConn) SetDeadline(t time.Time) error      { return c.stream.SetDeadline(t) }
+func (c *tunnelPacketConn) SetReadDeadline(t time.Time) error  { return c.stream.SetReadDeadline(t) }
+func (c *tunnelPacketConn) SetWriteDeadline(t time.Time) error { return c.stream.SetWriteDeadline(t) }

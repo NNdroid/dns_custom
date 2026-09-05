@@ -82,10 +82,10 @@ jobs:
             echo "Building ${platform} -> ${output}"
             if [ -n "${goarm:-}" ]; then
               CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOARM="${goarm#v}" \
-                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${output}" .
+                go build -trimpath -ldflags="-s -w  -X github.com/NNdroid/dns_custom.Version=${VERSION}" -o "${output}" ./cmd/dns_custom
             else
               CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
-                go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o "${output}" .
+                go build -trimpath -ldflags="-s -w  -X github.com/NNdroid/dns_custom.Version=${VERSION}" -o "${output}" ./cmd/dns_custom
             fi
           done
 

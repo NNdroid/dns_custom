@@ -2,6 +2,8 @@
 *.test
 *.out
 go.work
+bin/
+dist/
 
 .workbuddy/
 .codebuddy/

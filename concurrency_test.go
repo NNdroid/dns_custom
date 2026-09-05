@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -40,11 +40,14 @@ func startEchoBackend(t *testing.T) string {
 // startTunnelServer boots a DNSServer on an OS-assigned UDP port.
 func startTunnelServer(t *testing.T, domain, target, privKey string) string {
 	t.Helper()
-	srv := NewDNSServer(ServerConfig{
+	srv, err := NewDNSServer(ServerConfig{
 		Domain:     domain,
 		TargetAddr: target,
 		PrivateKey: privKey,
 	})
+	if err != nil {
+		t.Fatalf("NewDNSServer failed: %v", err)
+	}
 	return startTestDNSServer(t, srv)
 }
 
@@ -348,7 +351,10 @@ func benchmarkTunnelThroughput(b *testing.B, paths int) {
 	}()
 
 	domain := "tunnel.bench.local"
-	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	if err != nil {
+		b.Fatal(err)
+	}
 	dnsAddr := startTestDNSServer(b, srv)
 
 	servers := make([]string, 0, paths)

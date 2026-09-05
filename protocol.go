@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -55,18 +55,32 @@ const (
 	// before they stop asking for more, so a slow reader cannot make the tunnel hoard
 	// answers in memory.
 	dnsTunnelDownstreamBacklog = 64 * 1024
-	// A downstream chunk still unacked after this long is abandoned and a gap is
-	// accepted. Without this, one response that a resolver keeps dropping would
-	// stall the whole stream forever (the server retransmits the oldest chunk and
-	// never serves anything else).
+	// dnsTunnelDownstreamGiveUp is how long a downstream chunk still unacked is
+	// abandoned and a gap is accepted. Without this, one response that a resolver
+	// keeps dropping would stall the whole stream forever (the server retransmits
+	// the oldest chunk and never serves anything else).
 	dnsTunnelDownstreamGiveUp = 30 * time.Second
+	// Target declarations get a wider, independent retry window than data chunks:
+	// with Noise on, the declaration waits for the handshake query to land first,
+	// and through recursive resolvers that can take several seconds. Losing the
+	// window silently downgrades the session to the server default target, which
+	// is much worse than taking a moment longer to declare.
+	dnsTunnelTargetAttempts = 10
+	dnsTunnelTargetBackoff  = 300 * time.Millisecond
 )
 
 const (
-	flagData  = 'D'
-	flagPoll  = 'P'
-	flagClose = 'C'
+	flagData   = 'D'
+	flagPoll   = 'P'
+	flagClose  = 'C'
+	flagTarget = 'T'
 )
+
+// dnsTunnelControlSeq is a reserved sequence number outside both data streams,
+// used only by flagTarget queries and their payloads. The AEAD nonce is derived
+// from the sequence, so a control exchange must never collide with a data chunk
+// nonce; a stream would need 4 billion chunks (~137 GB) to reach it.
+const dnsTunnelControlSeq = ^uint32(0)
 
 // seqLess compares two sequence numbers safely across uint32 wraparound.
 // Plain `<` would misread a fresh chunk as a stale duplicate once the counter
@@ -196,6 +210,11 @@ const nonTxtNoiseHeaderSize = 4
 // the answer, so a data query plus a full-size chunk easily overruns this).
 const dnsTunnelMaxUDPResponse = 512
 
+// dnsTunnelEDNS0UDPSize is the UDP payload size the tunnel announces in EDNS0
+// OPT records when the edns option is on, and the budget the server sizes its
+// answers against. 1232 is the common IPv6-safe MTU-derived choice.
+const dnsTunnelEDNS0UDPSize = 1232
+
 // encodedRdataSize is the wire size of an answer's rdata for n payload bytes.
 func encodedRdataSize(n int, qtype uint16) int {
 	switch qtype {
@@ -218,12 +237,18 @@ func encodedRdataSize(n int, qtype uint16) int {
 // which carries the upstream chunk inside its name - leaves much less room for the
 // downstream payload than a short poll does.
 func fitDownstreamPayload(qname string, n int, qtype uint16) int {
+	return fitDownstreamPayloadBudget(qname, n, qtype, dnsTunnelMaxUDPResponse)
+}
+
+// fitDownstreamPayloadBudget is fitDownstreamPayload with a caller-supplied
+// response budget — the EDNS0 path passes the negotiated UDP size instead of 512.
+func fitDownstreamPayloadBudget(qname string, n int, qtype uint16, udpBudget int) int {
 	if n <= 0 {
 		return 0
 	}
 	// Header (12) + question (name + 4) + answer header (name echoed + 10).
 	fixed := 12 + (len(qname) + 2) + 4 + (len(qname) + 2) + 10
-	budget := dnsTunnelMaxUDPResponse - fixed
+	budget := udpBudget - fixed
 	if budget <= 0 {
 		return 0
 	}
@@ -245,6 +270,10 @@ func fitDownstreamPayload(qname string, n int, qtype uint16) int {
 // record type capacity, minus the framing overhead the receiver has to see, shrunk
 // until the whole response fits on the wire.
 func maxDownstreamPayload(qtype uint16, noise bool, qname string) int {
+	return maxDownstreamPayloadBudget(qtype, noise, qname, dnsTunnelMaxUDPResponse)
+}
+
+func maxDownstreamPayloadBudget(qtype uint16, noise bool, qname string, udpBudget int) int {
 	capacity := downstreamCap(qtype, noise)
 	overhead := 0
 	switch {
@@ -258,7 +287,7 @@ func maxDownstreamPayload(qtype uint16, noise bool, qname string) int {
 			overhead = nonTxtNoiseHeaderSize + noiseTagSize
 		}
 	}
-	avail := fitDownstreamPayload(qname, capacity+overhead, qtype) - overhead
+	avail := fitDownstreamPayloadBudget(qname, capacity+overhead, qtype, udpBudget) - overhead
 	if avail > capacity {
 		avail = capacity
 	}
@@ -275,7 +304,13 @@ func maxDownstreamPayload(qtype uint16, noise bool, qname string) int {
 func downstreamCap(qtype uint16, noise bool) int {
 	switch qtype {
 	case dns.TypeNULL:
-		// NULL RDATA is raw bytes, bounded only by the 512-byte UDP response.
+		// NULL RDATA is raw bytes, bounded only by the UDP response budget.
+		return dnsTunnelMaxServerChunk
+	case dns.TypeTXT:
+		// TXT RDATA is a list of strings, so unlike the single-label records it
+		// scales with the response budget (splitTxt keeps each string <= 248
+		// chars). It is still capped by dnsTunnelMaxServerChunk, which the fit
+		// shrinks further to whatever the wire budget allows.
 		return dnsTunnelMaxServerChunk
 	case dns.TypeA:
 		return 4
@@ -298,6 +333,22 @@ func encodeDownstreamFrame(serverSeq, skipTo uint32, payload []byte) []byte {
 	binary.BigEndian.PutUint32(buf[4:8], skipTo)
 	copy(buf[downstreamHeaderSize:], payload)
 	return buf
+}
+
+// UDP datagram framing over the tunnel byte stream. A UDP-mode session prefixes
+// every datagram with a 2-byte big-endian length, in both directions, so datagram
+// boundaries survive chunking and reassembly. The framing lives above the tunnel
+// byte stream and needs no change to the DNS wire format.
+const (
+	udpFrameHeaderSize  = 2
+	udpFrameMaxDatagram = 65535
+)
+
+func encodeUDPFrame(payload []byte) []byte {
+	frame := make([]byte, udpFrameHeaderSize+len(payload))
+	binary.BigEndian.PutUint16(frame[:udpFrameHeaderSize], uint16(len(payload)))
+	copy(frame[udpFrameHeaderSize:], payload)
+	return frame
 }
 
 func decodeDownstreamFrame(buf []byte) (serverSeq, skipTo uint32, payload []byte, ok bool) {
@@ -338,7 +389,7 @@ func parseQueryNameForDomain(domain string, domainLabelCount int, name string) (
 	} else {
 		return "", 0, 0, 0, 0, nil, fmt.Errorf("invalid flag in %q", name)
 	}
-	if flag != flagData && flag != flagPoll && flag != flagClose {
+	if flag != flagData && flag != flagPoll && flag != flagClose && flag != flagTarget {
 		return "", 0, 0, 0, 0, nil, fmt.Errorf("unsupported flag %q in %q", flag, name)
 	}
 	ds, e := strconv.ParseUint(labels[markerIndex-3], 10, 32)
@@ -472,4 +523,132 @@ func extractAnswer(rr dns.RR) []byte {
 		return decodeTunnelLabel(v.Ns)
 	}
 	return nil
+}
+
+// Target declaration exchange (flag 'T'). A client may declare the backend it
+// wants the session forwarded to; the server validates the request against its
+// allow list and answers with the transport that actually applies — declared or
+// default — so the client always learns whether to bind TCP or UDP locally.
+//
+//	request  [udpMarker:1][addr...]  udpMarker = 1 for a udp:// target, 0 for tcp;
+//	                                 addr empty = "use the server default".
+//	                                 Encrypted with the reserved control sequence
+//	                                 when Noise is on (the backend address is the
+//	                                 sensitive part), plaintext otherwise.
+//	response [status:1][udpMarker:1] Always plaintext and 2 bytes so it fits every
+//	                                 record type, A/AAAA included: it leaks nothing
+//	                                 but the transport.
+const (
+	targetFlagUDP    = 1
+	targetStatusOK   = 0
+	targetStatusDeny = 1
+)
+
+func encodeTargetRequest(addr string, udp bool) []byte {
+	marker := byte(0)
+	if udp {
+		marker = targetFlagUDP
+	}
+	return append([]byte{marker}, addr...)
+}
+
+func decodeTargetRequest(payload []byte) (addr string, udp bool, ok bool) {
+	if len(payload) < 1 {
+		return "", false, false
+	}
+	return string(payload[1:]), payload[0] == targetFlagUDP, true
+}
+
+func encodeTargetResponse(status byte, udp bool) []byte {
+	marker := byte(0)
+	if udp {
+		marker = targetFlagUDP
+	}
+	return []byte{status, marker}
+}
+
+func decodeTargetResponse(payload []byte) (status byte, udp bool, ok bool) {
+	if len(payload) < 2 {
+		return 0, false, false
+	}
+	return payload[0], payload[1] == targetFlagUDP, true
+}
+
+// matchTargetPattern reports whether a requested target matches one allow-list
+// pattern. All three parts (scheme, host, port) must match; each part may be
+// "*", and host patterns may contain "*" wildcards that match any run of
+// characters excluding ".", so "10.8.0.*" matches "10.8.0.5" and
+// "*.example.com" matches exactly one label depth. Host matching is literal —
+// patterns are never resolved through DNS, so a pattern is safe against DNS
+// rebinding only when it names an IP or a host whose address the operator
+// controls.
+func matchTargetPattern(pattern, network, addr string) bool {
+	pScheme, pHost, pPort := splitTargetPattern(pattern)
+	rScheme, rHost, rPort := splitTargetPattern(network + "://" + addr)
+	if pScheme != "*" && !strings.EqualFold(pScheme, rScheme) {
+		return false
+	}
+	if pHost != "*" && !globHostMatch(pHost, rHost) {
+		return false
+	}
+	if pPort != "*" && pPort != "" && pPort != rPort {
+		return false
+	}
+	return true
+}
+
+// globHostMatch matches s against pattern where "*" matches any run of
+// characters excluding "." (case-insensitive). Empty pattern matches only empty s.
+func globHostMatch(pattern, s string) bool {
+	p := strings.ToLower(pattern)
+	v := strings.ToLower(s)
+	if p == "" {
+		return v == ""
+	}
+	if p[0] == '*' {
+		rest := p[1:]
+		if globHostMatch(rest, v) {
+			return true
+		}
+		for i := 0; i < len(v) && v[i] != '.'; i++ {
+			if globHostMatch(rest, v[i+1:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if v == "" {
+		return false
+	}
+	if p[0] == v[0] || p[0] == '?' {
+		return globHostMatch(p[1:], v[1:])
+	}
+	return false
+}
+
+func splitTargetPattern(s string) (scheme, host, port string) {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme = s[:i]
+		s = s[i+3:]
+	} else {
+		scheme = "*"
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.Contains(s[i:], "]") {
+		host, port = s[:i], s[i+1:]
+	} else {
+		host = s
+	}
+	return scheme, host, port
+}
+
+// targetAllowed reports whether a requested target passes the server's allow
+// list. An empty list means the client cannot override the target at all.
+func targetAllowed(patterns []string, network, addr string) bool {
+	for _, p := range patterns {
+		if matchTargetPattern(p, network, addr) {
+			return true
+		}
+	}
+	return false
 }
