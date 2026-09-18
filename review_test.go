@@ -1,15 +1,16 @@
-package main
+package dnstunnel
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 
 func TestParseQueryNameRejectsMalformedInput(t *testing.T) {
 	domain := "tunnel.example.com"
-	valid := buildQueryName(domain, "session", 11, 7, 3, flagData, []byte("payload"))
+	valid := buildQueryName("tunnel2", domain, "session", 11, 7, 3, flagData, []byte("payload"))
 	session, querySeq, ack, dataSeq, flag, data, err := parseQueryName(domain, valid)
 	if err != nil {
 		t.Fatalf("valid query rejected: %v", err)
@@ -35,11 +36,11 @@ func TestParseQueryNameRejectsMalformedInput(t *testing.T) {
 		return strings.Join(copyLabels, ".") + "."
 	}
 	cases := map[string]string{
-		"bad query sequence":  queryWith(0, "x"),
-		"bad acknowledgement": queryWith(1, "x"),
-		"unknown flag":        queryWith(2, "X"),
-		"bad data sequence":   queryWith(3, "x"),
-		"bad base32 payload":  queryWith(4, "not-valid!"),
+		"bad query sequence":  queryWith(1, "x"),
+		"bad acknowledgement": queryWith(2, "x"),
+		"unknown flag":        queryWith(3, "X"),
+		"bad data sequence":   queryWith(4, "x"),
+		"bad base32 payload":  queryWith(5, "not-valid!"),
 		"wrong domain":        queryWith(len(labels)-1, "invalid"),
 	}
 	for name, query := range cases {
@@ -53,8 +54,8 @@ func TestParseQueryNameRejectsMalformedInput(t *testing.T) {
 
 func TestFitDownstreamPayloadMatchesLinearReference(t *testing.T) {
 	qnames := []string{
-		buildQueryName("t.example", "s", 1, 0, 0, flagPoll, nil),
-		buildQueryName("a-very-long-tunnel-name.example.com", "0123456789abcdef", 12345, 67890, 7, flagData, make([]byte, 38)),
+		buildQueryName("tunnel2", "t.example", "s", 1, 0, 0, flagPoll, nil),
+		buildQueryName("tunnel2", "a-very-long-tunnel-name.example.com", "0123456789abcdef", 12345, 67890, 7, flagData, make([]byte, 38)),
 	}
 	for _, qname := range qnames {
 		for _, qtype := range []uint16{dns.TypeTXT, dns.TypeNULL, dns.TypeCNAME, dns.TypeA, dns.TypeAAAA} {
@@ -68,7 +69,7 @@ func TestFitDownstreamPayloadMatchesLinearReference(t *testing.T) {
 				if budget <= 0 {
 					want = 0
 				}
-				if got := fitDownstreamPayload(qname, requested, qtype); got != want {
+				if got := fitDownstreamPayload(len(qname), requested, qtype); got != want {
 					t.Fatalf("qtype=%d requested=%d: got %d want %d", qtype, requested, got, want)
 				}
 			}
@@ -107,7 +108,10 @@ func TestConcurrentDownstreamDeliveryStaysOrdered(t *testing.T) {
 }
 
 func TestUnknownPollDoesNotCreateSession(t *testing.T) {
-	srv := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
+	srv, err := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if sess, created := srv.getOrCreateSession("unknown", 0, nil, false); sess != nil || created {
 		t.Fatalf("unknown poll returned session=%v created=%v", sess, created)
 	}
@@ -120,7 +124,7 @@ func TestUnknownPollDoesNotCreateSession(t *testing.T) {
 }
 
 func TestServerBufferBackpressureWakesOnDrain(t *testing.T) {
-	sess := newDnsSession("backpressure", "tcp", "127.0.0.1:1", nil)
+	sess := newDnsSession("backpressure", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	sess.serverBuf.Write(make([]byte, dnsTunnelServerBufferLimit))
 	done := make(chan bool, 1)
 	go func() { done <- sess.pushServer([]byte{1}) }()
@@ -131,7 +135,7 @@ func TestServerBufferBackpressureWakesOnDrain(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
-	if frame := sess.serveDownstream(dns.TypeTXT, testPollQName); len(frame) == 0 {
+	if frame := sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse); len(frame) == 0 {
 		t.Fatal("serveDownstream did not drain the buffer")
 	}
 	select {
@@ -151,7 +155,7 @@ func TestDoHResponseSizeIsBounded(t *testing.T) {
 	}))
 	defer endpoint.Close()
 
-	path := newDNSPath(endpoint.URL)
+	path := newDNSPath(endpoint.URL, nil, nil)
 	defer path.close()
 	msg := new(dns.Msg)
 	msg.SetQuestion("example.com.", dns.TypeA)
@@ -160,51 +164,185 @@ func TestDoHResponseSizeIsBounded(t *testing.T) {
 	}
 }
 
-func TestDecryptStunURIRejectsMalformedEnvelope(t *testing.T) {
-	encode := func(env shareEnvelope) string {
-		raw, err := json.Marshal(env)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return "stun://" + base64.StdEncoding.EncodeToString(raw)
-	}
-	validField := func(n int) string { return base64.StdEncoding.EncodeToString(make([]byte, n)) }
-	cases := map[string]shareEnvelope{
-		"compression flag": {V: 1, G: 2, S: validField(shareSaltLen), I: validField(shareIvLen), C: validField(16)},
-		"salt length":      {V: 1, S: validField(1), I: validField(shareIvLen), C: validField(16)},
-		"nonce length":     {V: 1, S: validField(shareSaltLen), I: validField(1), C: validField(16)},
-		"ciphertext":       {V: 1, S: validField(shareSaltLen), I: validField(shareIvLen), C: validField(1)},
-	}
-	for name, env := range cases {
-		t.Run(name, func(t *testing.T) {
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					t.Fatalf("malformed envelope panicked: %v", recovered)
-				}
-			}()
-			if _, err := decryptStunURI(encode(env), "123456"); err == nil {
-				t.Fatal("malformed envelope was accepted")
-			}
-		})
+func TestDNSPathRejectsAuthoritativeNXDOMAIN(t *testing.T) {
+	addr := startTestDNSServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeNameError)
+		_ = w.WriteMsg(reply)
+	}))
+	path := newDNSPath(addr, nil, nil)
+	defer path.close()
+	msg := new(dns.Msg)
+	msg.SetQuestion("missing.tunnel.example.", dns.TypeTXT)
+	_, err := path.exchange(context.Background(), msg)
+	if !errors.Is(err, ErrServerSessionGone) {
+		t.Fatalf("NXDOMAIN error = %v, want ErrServerSessionGone", err)
 	}
 }
 
-func TestDirectProtocolURIEscapesQueryValues(t *testing.T) {
-	servers := "https://dns.example/dns-query,1.1.1.1:53"
-	pubKey := "a+b/c=="
-	raw := generateDirectProtocolURI("tunnel.example", pubKey, servers, "txt")
-	parsed, err := url.Parse(raw)
+func TestDoHPathRejectsAuthoritativeNXDOMAIN(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		wire, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		query := new(dns.Msg)
+		if err := query.Unpack(wire); err != nil {
+			t.Error(err)
+			return
+		}
+		reply := new(dns.Msg)
+		reply.SetRcode(query, dns.RcodeNameError)
+		packed, err := reply.Pack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/dns-message")
+		_, _ = w.Write(packed)
+	}))
+	defer endpoint.Close()
+	path := newDNSPath(endpoint.URL, nil, nil)
+	defer path.close()
+	msg := new(dns.Msg)
+	msg.SetQuestion("missing.tunnel.example.", dns.TypeTXT)
+	_, err := path.exchange(context.Background(), msg)
+	if !errors.Is(err, ErrServerSessionGone) {
+		t.Fatalf("DoH NXDOMAIN error = %v, want ErrServerSessionGone", err)
+	}
+}
+
+func TestClosedSessionIsRemovedImmediately(t *testing.T) {
+	srv, err := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
 	if err != nil {
-		t.Fatalf("parse generated URI: %v", err)
+		t.Fatal(err)
 	}
-	if parsed.Scheme != "dnsc" || parsed.Host != "tunnel.example" {
-		t.Fatalf("unexpected URI authority: %s", raw)
+	sess, created := srv.getOrCreateSession("closed-session", 1, []byte("x"), true)
+	if sess == nil || !created {
+		t.Fatal("session was not created")
 	}
-	if got := parsed.Query().Get("servers"); got != servers {
-		t.Fatalf("servers round trip = %q, want %q", got, servers)
+	sess.close()
+	srv.mu.RLock()
+	_, stillPresent := srv.sessions[sess.sessionID]
+	srv.mu.RUnlock()
+	if stillPresent {
+		t.Fatal("closed session remained addressable")
 	}
-	if got := parsed.Query().Get("pubkey"); got != pubKey {
-		t.Fatalf("pubkey round trip = %q, want %q", got, pubKey)
+	if got, created := srv.getOrCreateSession(sess.sessionID, 0, nil, false); got != nil || created {
+		t.Fatalf("closed session lookup = (%v, %v), want (nil, false)", got, created)
+	}
+}
+
+func TestClosedSessionIsRetainedUntilDownstreamTailDrains(t *testing.T) {
+	srv, err := NewDNSServer(ServerConfig{Domain: "tunnel.example", TargetAddr: "127.0.0.1:1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, created := srv.getOrCreateSession("closed-tail", 1, []byte("x"), true)
+	if sess == nil || !created || !sess.pushServer([]byte("tail")) {
+		t.Fatal("session with downstream tail was not prepared")
+	}
+	sess.close()
+	srv.mu.RLock()
+	_, retained := srv.sessions[sess.sessionID]
+	srv.mu.RUnlock()
+	if !retained {
+		t.Fatal("closed session was removed before its downstream tail could be read")
+	}
+	if got := sess.popServerNow(16, false); string(got) != "tail" {
+		t.Fatalf("downstream tail = %q, want tail", got)
+	}
+	srv.mu.RLock()
+	_, retained = srv.sessions[sess.sessionID]
+	srv.mu.RUnlock()
+	if retained {
+		t.Fatal("closed session remained after its downstream tail drained")
+	}
+}
+
+func TestWriteSurvivesMoreThanLegacyRetryLimit(t *testing.T) {
+	const domain = "recover.tunnel.example"
+	backend := startTCPEchoBackend(t)
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failed atomic.Int32
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) > 0 {
+			_, _, _, _, flag, data, parseErr := parseQueryName(domain, req.Question[0].Name)
+			if parseErr == nil && flag == flagData && len(data) > 0 && failed.Add(1) <= 6 {
+				reply := new(dns.Msg)
+				reply.SetRcode(req, dns.RcodeServerFailure)
+				_ = w.WriteMsg(reply)
+				return
+			}
+		}
+		srv.ServeDNS(w, req)
+	})
+	addr := startTestDNSServer(t, handler)
+	cli, err := NewClient(ClientConfig{Domain: domain, Servers: []string{addr}, RecordType: "txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := cli.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(12 * time.Second))
+	if _, err := conn.Write([]byte("r")); err != nil {
+		t.Fatalf("write did not recover: %v", err)
+	}
+	got := make([]byte, 1)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("echo after recovery: %v", err)
+	}
+	if string(got) != "r" || failed.Load() < 6 {
+		t.Fatalf("echo=%q failedAttempts=%d", got, failed.Load())
+	}
+}
+
+func TestWriteRetryStopsAtDeadline(t *testing.T) {
+	const domain = "deadline.tunnel.example"
+	backend := startTCPEchoBackend(t)
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) > 0 {
+			_, _, _, _, flag, data, parseErr := parseQueryName(domain, req.Question[0].Name)
+			if parseErr == nil && flag == flagData && len(data) > 0 {
+				// Simulate a black-holed resolver: the client's normal transport
+				// timeout is four seconds, so only the write deadline can unblock it.
+				return
+			}
+		}
+		srv.ServeDNS(w, req)
+	})
+	addr := startTestDNSServer(t, handler)
+	cli, err := NewClient(ClientConfig{Domain: domain, Servers: []string{addr}, RecordType: "txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := cli.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	_ = conn.SetWriteDeadline(start.Add(350 * time.Millisecond))
+	if _, err := conn.Write([]byte("x")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("write error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("write deadline observed too late: %v", elapsed)
 	}
 }
 
@@ -212,6 +350,6 @@ func BenchmarkBuildQueryName(b *testing.B) {
 	payload := make([]byte, 38)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		_ = buildQueryName("tunnel.example.com.", "0123456789abcdef", uint32(i), 10, 11, flagData, payload)
+		_ = buildQueryName("tunnel2", "tunnel.example.com.", "0123456789abcdef", uint32(i), 10, 11, flagData, payload)
 	}
 }

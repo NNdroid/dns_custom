@@ -3,7 +3,10 @@
   "_fields": {
     "mode": "Operational mode: 'server' (authoritative DNS server) or 'client' (local proxy listener)",
     "listen": "UDP port to listen for incoming DNS queries (standard DNS port is :53)",
-    "target": "Backend service to forward traffic to (tcp://127.0.0.1:22 for SSH or udp://127.0.0.1:51820 for WireGuard)",
+    "target": "Default backend service (tcp://127.0.0.1:22 for SSH or udp://127.0.0.1:51820 for WireGuard)",
+    "allow_targets": "Patterns granting client-declared targets, e.g. [\"tcp://127.0.0.1:*\"]. Empty = default target only",
+    "max_sessions": "Concurrent session cap (0 = unlimited). Each session holds up to ~600KB of buffers",
+    "edns0": "Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)",
     "domain": "Authoritative DNS tunnel domain delegation (e.g. t.example.com)",
     "privkey": "Noise Curve25519 static private key for end-to-end AEAD encryption (generate with 'dns_custom gen-keys')",
     "log_level": "Logging verbosity: debug, info, warn, error"
@@ -11,6 +14,9 @@
   "mode": "server",
   "listen": ":53",
   "target": "tcp://127.0.0.1:22",
+  "allow_targets": [],
+  "max_sessions": 0,
+  "edns0": false,
   "domain": "tunnel.example.com",
   "privkey": "",
   "log_level": "info"

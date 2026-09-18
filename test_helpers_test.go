@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"net"
@@ -24,4 +24,23 @@ func startTestDNSServer(tb testing.TB, handler dns.Handler) string {
 		_ = packetConn.Close()
 	})
 	return packetConn.LocalAddr().String()
+}
+
+// startTestDNSTCPServer is startTestDNSServer over TCP: queries arriving there
+// exercise the server's TCP response budget (large chunks).
+func startTestDNSTCPServer(tb testing.TB, handler dns.Handler) string {
+	tb.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		tb.Fatalf("listen for test TCP DNS server: %v", err)
+	}
+	server := &dns.Server{Listener: ln, Handler: handler}
+	go func() {
+		_ = server.ActivateAndServe()
+	}()
+	tb.Cleanup(func() {
+		_ = server.Shutdown()
+		_ = ln.Close()
+	})
+	return ln.Addr().String()
 }

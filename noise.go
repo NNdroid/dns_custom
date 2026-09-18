@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"crypto/cipher"

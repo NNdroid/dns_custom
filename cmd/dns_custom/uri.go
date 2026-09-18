@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+
+	dnstunnel "github.com/NNdroid/dns_custom"
 )
 
 type StunProfile struct {
@@ -32,8 +34,8 @@ type StunProfile struct {
 func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin string) string {
 	pubHex, pubB64 := "", ""
 	if pubKey != "" {
-		if pk, err := ParseNoiseKey(pubKey); err == nil {
-			pubHex, pubB64 = FormatNoiseKey(pk)
+		if pk, err := dnstunnel.ParseNoiseKey(pubKey); err == nil {
+			pubHex, pubB64 = dnstunnel.FormatNoiseKey(pk)
 		}
 	}
 

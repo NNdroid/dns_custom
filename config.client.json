@@ -2,7 +2,9 @@
   "_description": "dns_custom DNS Tunnel Client Configuration",
   "_fields": {
     "mode": "Operational mode: 'client'",
-    "listen": "Local TCP port for local applications to connect to (e.g. 127.0.0.1:1080 for SOCKS/SSH)",
+    "listen": "Local address to bind for local applications; its transport follows the target automatically",
+    "target": "Optional backend declaration: tcp://host:port or udp://host:port; must pass the server allow_targets list (omit to use the server default)",
+    "edns0": "Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)",
     "domain": "Authoritative DNS tunnel domain matching the server domain",
     "servers": "Upstream DNS resolvers (supports standard UDP/TCP :53, DoT tls://, and DoH https://)",
     "record_type": "DNS query record type: txt (recommended), null, cname, a, aaaa, mx, srv, ns",
@@ -11,6 +13,8 @@
   },
   "mode": "client",
   "listen": "127.0.0.1:1080",
+  "target": "",
+  "edns0": false,
   "domain": "tunnel.example.com",
   "servers": [
     "8.8.8.8:53",

@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -40,11 +40,14 @@ func startEchoBackend(t *testing.T) string {
 // startTunnelServer boots a DNSServer on an OS-assigned UDP port.
 func startTunnelServer(t *testing.T, domain, target, privKey string) string {
 	t.Helper()
-	srv := NewDNSServer(ServerConfig{
+	srv, err := NewDNSServer(ServerConfig{
 		Domain:     domain,
 		TargetAddr: target,
 		PrivateKey: privKey,
 	})
+	if err != nil {
+		t.Fatalf("NewDNSServer failed: %v", err)
+	}
 	return startTestDNSServer(t, srv)
 }
 
@@ -279,8 +282,8 @@ func TestDownstreamCap(t *testing.T) {
 // whole exchange. The sender must size chunks against that budget.
 func TestDownstreamAnswerFitsUDP(t *testing.T) {
 	// Worst case names: a data query with a full upstream chunk label, and a short poll.
-	dataQName := buildQueryName(dns.Fqdn("tunnel.example.com"), "0123456789abcdef", 123456, 654321, 4242, flagData, make([]byte, 32))
-	pollQName := buildQueryName(dns.Fqdn("tunnel.example.com"), "0123456789abcdef", 123456, 654321, 0, flagPoll, nil)
+	dataQName := buildQueryName("tunnel2", dns.Fqdn("tunnel.example.com"), "0123456789abcdef", 123456, 654321, 4242, flagData, make([]byte, 32))
+	pollQName := buildQueryName("tunnel2", dns.Fqdn("tunnel.example.com"), "0123456789abcdef", 123456, 654321, 0, flagPoll, nil)
 
 	for _, qname := range []string{dataQName, pollQName} {
 		for _, qtype := range []uint16{dns.TypeTXT, dns.TypeNULL, dns.TypeCNAME, dns.TypeMX, dns.TypeSRV, dns.TypeNS, dns.TypeA, dns.TypeAAAA} {
@@ -288,7 +291,7 @@ func TestDownstreamAnswerFitsUDP(t *testing.T) {
 				if noise && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 					continue // rejected up front; cannot carry framed data at all
 				}
-				payload := make([]byte, maxDownstreamPayload(qtype, noise, qname))
+				payload := make([]byte, maxDownstreamPayload(qtype, noise, len(qname)))
 				if qtype != dns.TypeTXT && qtype != dns.TypeNULL && len(payload) == 0 {
 					t.Fatalf("%s: no capacity left for a plain UDP answer", qTypeToDnsType(qtype))
 				}
@@ -328,7 +331,11 @@ func TestDownstreamAnswerFitsUDP(t *testing.T) {
 
 // BenchmarkTunnelThroughput* measures end-to-end throughput over one vs. several
 // upstream paths. Run with: go test -run '^$' -bench 'TunnelThroughput' -benchtime 5x
-func benchmarkTunnelThroughput(b *testing.B, paths int) {
+func benchmarkTunnelThroughput(b *testing.B, paths int) { benchmarkTunnelBench(b, paths, false) }
+
+func benchmarkTunnelThroughputEDNS(b *testing.B, paths int) { benchmarkTunnelBench(b, paths, true) }
+
+func benchmarkTunnelBench(b *testing.B, paths int, edns bool) {
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		b.Fatalf("echo listen failed: %v", err)
@@ -348,7 +355,10 @@ func benchmarkTunnelThroughput(b *testing.B, paths int) {
 	}()
 
 	domain := "tunnel.bench.local"
-	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String(), EDNS0: edns})
+	if err != nil {
+		b.Fatal(err)
+	}
 	dnsAddr := startTestDNSServer(b, srv)
 
 	servers := make([]string, 0, paths)
@@ -365,7 +375,7 @@ func benchmarkTunnelThroughput(b *testing.B, paths int) {
 	b.SetBytes(size)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		tunnel, err := NewDNSClientTunnel(ctx, servers, domain, "txt", "")
+		tunnel, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", "", "", "", edns, nopLogger, nil, nil, nil, nil)
 		if err != nil {
 			b.Fatalf("NewDNSClientTunnel failed: %v", err)
 		}
@@ -385,9 +395,72 @@ func benchmarkTunnelThroughput(b *testing.B, paths int) {
 	}
 }
 
-func BenchmarkTunnelThroughput1Path(b *testing.B) { benchmarkTunnelThroughput(b, 1) }
-func BenchmarkTunnelThroughput2Path(b *testing.B) { benchmarkTunnelThroughput(b, 2) }
-func BenchmarkTunnelThroughput4Path(b *testing.B) { benchmarkTunnelThroughput(b, 4) }
+func BenchmarkTunnelThroughput1Path(b *testing.B)     { benchmarkTunnelThroughput(b, 1) }
+func BenchmarkTunnelThroughput2Path(b *testing.B)     { benchmarkTunnelThroughput(b, 2) }
+func BenchmarkTunnelThroughput4Path(b *testing.B)     { benchmarkTunnelThroughput(b, 4) }
+func BenchmarkTunnelThroughputEDNS1Path(b *testing.B) { benchmarkTunnelThroughputEDNS(b, 1) }
+func BenchmarkTunnelThroughputEDNS4Path(b *testing.B) { benchmarkTunnelThroughputEDNS(b, 4) }
+func BenchmarkTunnelThroughputTCP1Path(b *testing.B)  { benchmarkTunnelThroughputTCP(b, 1) }
+
+// benchmarkTunnelThroughputTCP is the fast-lane benchmark: the client talks to
+// the authoritative server over tcp:// directly, so the server serves 8 KiB
+// chunks (TCP response budget) instead of the UDP 512/1232-byte ones.
+func benchmarkTunnelThroughputTCP(b *testing.B, paths int) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("echo listen failed: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	domain := "tunnel.bench.local"
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dnsAddr := startTestDNSTCPServer(b, srv)
+
+	servers := make([]string, 0, paths)
+	for i := 0; i < paths; i++ {
+		servers = append(servers, "tcp://"+dnsAddr)
+	}
+
+	const size = 65536
+	payload := make([]byte, size)
+	recv := make([]byte, size)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b.SetBytes(size)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tunnel, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", "", "", "", false, nopLogger, nil, nil, nil, nil)
+		if err != nil {
+			b.Fatalf("NewDNSClientTunnel failed: %v", err)
+		}
+		if _, err := tunnel.Write(payload); err != nil {
+			b.Fatalf("write failed: %v", err)
+		}
+		if _, err := io.ReadFull(tunnel, recv); err != nil {
+			b.Fatalf("read failed: %v", err)
+		}
+		if !bytes.Equal(recv, payload) {
+			b.Fatalf("payload corrupted on round %d", i)
+		}
+		_ = tunnel.Close()
+	}
+}
 
 func firstDiff(a, b []byte) int {
 	for i := range a {

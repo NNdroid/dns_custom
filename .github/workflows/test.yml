@@ -1,0 +1,112 @@
+name: Test
+
+# Runs on every push and pull request: vet plus the race-detected test suite
+# on the three desktop platforms. This is the merge gate; release.yml repeats
+# the Linux run as a pre-publish check.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -timeout 10m ./...
+
+      - name: Test with race detector
+        run: go test -race -timeout 10m ./...
+
+      # Smoke-run every benchmark once (no meaningful numbers on shared
+      # runners): the point is to catch panics, deadlocks and bit-rot in the
+      # benchmarks themselves, which plain `go test` never executes.
+      - name: Benchmark smoke
+        run: go test -run '^$' -bench . -benchtime 1x -timeout 15m ./...
+
+      # Collect CPU and memory profiles from the benchmark run. The pprof
+      # artifacts are uploaded so developers can pull them locally for flame
+      # graphs and detailed analysis. -cpuprofile cannot span multiple
+      # packages, so the profile run targets only the root package where the
+      # throughput benchmarks live.
+      - name: Benchmark profiles
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          go test -run '^$' -bench 'BenchmarkTunnelThroughput' -benchtime 5s \
+            -cpuprofile cpu.prof -memprofile mem.prof -timeout 15m .
+
+      - name: Upload CPU profile
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-${{ matrix.os }}.prof
+          path: cpu.prof
+          if-no-files-found: ignore
+
+      - name: Upload memory profile
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem-${{ matrix.os }}.prof
+          path: mem.prof
+          if-no-files-found: ignore
+
+  # Full 32-bit gate: vet, tests and benchmark smoke compiled for GOARCH=386
+  # and executed natively (amd64 Linux kernels and 64-bit Windows run 386
+  # binaries directly, no emulator). This is where unaligned 64-bit atomics
+  # and int truncation would surface as runtime panics on real 32-bit CPUs.
+  # The race detector has no 386 instrumentation, so this job mirrors the
+  # main matrix without its -race step; CGO is off (the project is pure Go)
+  # so no 32-bit C toolchain is needed.
+  test-386:
+    name: Test 32-bit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      GOARCH: '386'
+      CGO_ENABLED: '0'
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -timeout 10m ./...
+
+      # Same benchmark smoke as the main matrix: proves every benchmark
+      # executes end to end under 32-bit addressing (alignment, overflow).
+      - name: Benchmark smoke
+        run: go test -run '^$' -bench . -benchtime 1x -timeout 15m ./...

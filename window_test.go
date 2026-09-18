@@ -1,4 +1,4 @@
-package main
+package dnstunnel
 
 import (
 	"bytes"
@@ -51,7 +51,10 @@ func benchmarkLatencyThroughput(b *testing.B, paths int, rtt time.Duration) {
 	}()
 
 	domain := fmt.Sprintf("tunnel.latbench%d.local", paths)
-	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	if err != nil {
+		b.Fatal(err)
+	}
 	dnsAddr := startTestDNSServer(b, latencyHandler{inner: srv, d: rtt})
 
 	servers := make([]string, 0, paths)
@@ -123,7 +126,10 @@ func TestTransferOverLatencyPath(t *testing.T) {
 	}()
 
 	domain := "tunnel.latency.local"
-	srv := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	srv, serr := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	if serr != nil {
+		t.Fatal(serr)
+	}
 	dnsAddr := startTestDNSServer(t, latencyHandler{inner: srv, d: 20 * time.Millisecond})
 
 	tunnel, err := NewDNSClientTunnel(ctx, []string{dnsAddr}, domain, "txt", "")
