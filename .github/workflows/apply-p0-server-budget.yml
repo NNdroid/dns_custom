@@ -18,109 +18,14 @@ jobs:
       - name: Checkout perf branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: perf/throughput-p0
           fetch-depth: 0
 
-      - name: Decouple downstream response budget from longest QNAME
-        shell: bash
+      - name: Apply response-budget patch
+        run: python3 scripts/apply_p0_server_budget.py
+
+      - name: Format and validate diff
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('server.go')
-          text = path.read_text()
-          replacements = [
-              (
-                  '\tmaxQnameLen      int                         // longest query name seen this session; chunks are sized to fit it\n',
-                  '',
-              ),
-              (
-                  '''// noteQnameLen records the longest query name observed for this session and
-// returns it. Chunks are always sized against the longest name: a chunk created
-// for a short poll may be retransmitted inside a much longer data query's
-// answer, and an oversized response is dropped by the client's UDP buffer —
-// that drop was a permanent retransmit loop with multi-label data names.
-func (s *dnsSession) noteQnameLen(l int) int {
-\ts.mu.Lock()
-\tif l > s.maxQnameLen {
-\t\ts.maxQnameLen = l
-\t}
-\tlongest := s.maxQnameLen
-\ts.mu.Unlock()
-\treturn longest
-}
-
-''',
-                  '',
-              ),
-              (
-                  '\tdownstreamData := sess.serveDownstream(q.Qtype, sess.noteQnameLen(len(q.Name)), udpBudget)',
-                  '\tdownstreamData := sess.serveDownstream(q.Qtype, len(q.Name), udpBudget)',
-              ),
-              (
-                  '''\tif len(s.serverOut) > 0 {
-\t\t// Window full (or nothing fresh to send): refill the oldest gap. The frame
-\t\t// is rebuilt each time so retransmissions carry the current skipTo.
-\t\toldest := s.serverOutOrder[0]
-\t\treturn encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
-\t}
-\treturn nil
-''',
-                  '''\tif len(s.serverOut) > 0 {
-\t\t// Window full (or nothing fresh to send): refill the oldest gap, but
-\t\t// only when this query's response budget can carry the stored chunk.
-\t\t// A short poll may create a large chunk that cannot fit inside the
-\t\t// response to a near-maximum data QNAME. In that case leave the chunk
-\t\t// outstanding and let a later poll retransmit it instead of poisoning
-\t\t// the whole session with the longest QNAME ever observed.
-\t\toldest := s.serverOutOrder[0]
-\t\tct := s.serverOut[oldest].ct
-\t\tretransmitLimit := maxPayload
-\t\tif noise {
-\t\t\tretransmitLimit += noiseTagSize
-\t\t}
-\t\tif maxPayload > 0 && len(ct) <= retransmitLimit {
-\t\t\treturn encodeDownstreamFrame(oldest, s.serverSkipTo, ct)
-\t\t}
-\t}
-\treturn nil
-''',
-              ),
-          ]
-
-          for old, new in replacements:
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f'server.go replacement matched {count} times; refusing unsafe patch')
-              text = text.replace(old, new, 1)
-          path.write_text(text)
-
-          protocol = Path('protocol.go')
-          ptext = protocol.read_text()
-          old = '''// fitDownstreamPayloadBudget is fitDownstreamPayload with a caller-supplied
-// response budget and query-name length — the EDNS0 path passes the negotiated
-// UDP size instead of 512, and the server passes the session's longest observed
-// query name so every chunk fits any query it may be retransmitted in.
-'''
-          new = '''// fitDownstreamPayloadBudget is fitDownstreamPayload with a caller-supplied
-// response budget and query-name length — the EDNS0 path passes the negotiated
-// UDP size instead of 512. Reliable retransmits that do not fit the current
-// query wait for a later shorter query (normally a poll).
-'''
-          if ptext.count(old) != 1:
-              raise SystemExit('protocol.go response-budget comment did not match exactly once')
-          ptext = ptext.replace(old, new, 1)
-          old = '''\t// Every chunk must be deliverable under ANY query name it may later be
-\t// retransmitted in, not just the one that triggered its creation.
-'''
-          new = '''\t// Size the chunk for the QNAME carrying this response. A stored reliable
-\t// chunk that does not fit a later longer QNAME is deferred until a short poll.
-'''
-          if ptext.count(old) != 1:
-              raise SystemExit('protocol.go retransmit comment did not match exactly once')
-          protocol.write_text(ptext.replace(old, new, 1))
-          PY
-
           gofmt -w server.go protocol.go
           git diff --check
 
@@ -128,11 +33,9 @@ func (s *dnsSession) noteQnameLen(l int) int {
         run: go test ./... -run 'TestServeDownstream|TestMaxUpstream|TestDynamicUpstream' -count=1
 
       - name: Commit and push
-        shell: bash
         run: |
-          set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add server.go protocol.go
           git commit -m 'fix: decouple downstream budget from long data qnames'
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin HEAD:perf/throughput-p0
