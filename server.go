@@ -587,8 +587,15 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 	if len(s.serverOut) > 0 {
 		// Window full (or nothing fresh to send): refill the oldest gap. The frame
 		// is rebuilt each time so retransmissions carry the current skipTo.
+		// A chunk created for a short POLL query may not fit a later long DATA
+		// query. Do not truncate or discard it: return an empty response here and
+		// let one of the client's short poll queries retransmit it.
 		oldest := s.serverOutOrder[0]
-		return encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
+		frame := encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
+		if fitDownstreamPayloadBudget(qnameLen, len(frame), dns.TypeTXT, udpBudget) < len(frame) {
+			return nil
+		}
+		return frame
 	}
 	return nil
 }
@@ -1276,7 +1283,8 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		udpBudget = dnsTunnelMaxUDPResponse
 	}
 
-	downstreamData := sess.serveDownstream(q.Qtype, sess.noteQnameLen(len(q.Name)), udpBudget)
+	sess.noteQnameLen(len(q.Name))
+	downstreamData := sess.serveDownstream(q.Qtype, len(q.Name), udpBudget)
 	if len(downstreamData) > 0 {
 		rr := makeAnswer(q.Name, q.Qtype, downstreamData, s.domain)
 		if rr != nil {

@@ -1733,25 +1733,18 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 	return "", fmt.Errorf("dnstunnel: target declaration failed after %d attempts: %w", dnsTunnelTargetAttempts, lastErr)
 }
 
-// setChunkSize re-sizes upstream chunks to the multi-label capacity, provided
-// the session's worst-case query name still fits the DNS 255-octet name limit.
+// setChunkSize expands upstream DATA chunks to the largest multi-label payload
+// that fits the DNS QNAME safety budget. Old servers that do not answer the
+// capability/target probe never call this method, preserving the historical
+// conservative 32-byte (22-byte with Noise) fallback.
 func (t *DNSClientTunnel) setChunkSize() {
-	worst := len(t.session) + 1 + // session.
-		10 + 1 + // seq.
-		10 + 1 + // ack.
-		1 + 1 + // flag.
-		10 + 1 + // dataSeq.
-		123 + // two 61-char data labels plus their separating dot
-		1 + len(dnsTunnelMarker) + 1 + // .tunnel2.
-		len(t.domain) // fqdn domain includes its trailing dot
-	if worst > 253 {
-		t.log.Warnf("Domain too long for multi-label queries; staying on single-label chunk size")
+	noise := t.noiseSession != nil && t.noiseSession.SendCipher != nil
+	chunk := maxUpstreamPlainChunk(t.domain, t.marker, t.session, noise)
+	if chunk <= 0 {
+		t.log.Warnf("Domain/marker too long for expanded multi-label queries; staying on conservative chunk size")
 		return
 	}
-	t.chunkSize = 2 * 61 * 5 / 8 // two labels of base32 carry 76 wire bytes
-	if t.noiseSession != nil {
-		t.chunkSize -= noiseTagSize
-	}
+	t.chunkSize = chunk
 }
 
 // Transport reports the backend transport the server confirmed for this session
