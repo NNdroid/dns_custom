@@ -501,14 +501,30 @@ func parseQueryNameV2(labels []string, markerIndex int, name string) (session st
 // payload is base32'd as a whole and split into 61-character labels; an empty
 // payload emits no data labels at all.
 func buildQueryName(marker, domain, session string, seq, ack, dataSeq uint32, flag byte, data []byte) string {
+	return buildQueryNameWithCase(marker, domain, session, seq, ack, dataSeq, flag, data, false)
+}
+
+// buildQueryNameRandomized is the client hot path: it applies DNS 0x20
+// case randomization while the final QNAME is still mutable, so only one
+// []byte -> string conversion is required.
+func buildQueryNameRandomized(marker, domain, session string, seq, ack, dataSeq uint32, flag byte, data []byte) string {
+	return buildQueryNameWithCase(marker, domain, session, seq, ack, dataSeq, flag, data, true)
+}
+
+func buildQueryNameWithCase(marker, domain, session string, seq, ack, dataSeq uint32, flag byte, data []byte, randomCase bool) string {
 	domain = dns.Fqdn(domain)
 	pooled := queryNameBufferPool.Get().(*[]byte)
-	required := len(domain) + len(session) + dnsTunnelB32.EncodedLen(len(data)) + 64
+	enc := dnsTunnelB32.EncodedLen(len(data))
+	labels := 0
+	if enc > 0 {
+		labels = (enc + dnsTunnelPayloadLabelChars - 1) / dnsTunnelPayloadLabelChars
+	}
+	required := len(domain) + len(session) + enc + labels + 64
 	buf := (*pooled)[:0]
 	if cap(buf) < required {
 		buf = make([]byte, 0, required)
 	}
-	// Head: session first, then the four numeric fields.
+
 	buf = append(buf, session...)
 	buf = append(buf, '.')
 	buf = strconv.AppendUint(buf, uint64(seq), 10)
@@ -518,28 +534,36 @@ func buildQueryName(marker, domain, session string, seq, ack, dataSeq uint32, fl
 	buf = append(buf, flag, '.')
 	buf = strconv.AppendUint(buf, uint64(dataSeq), 10)
 	buf = append(buf, '.')
-	if len(data) > 0 {
-		// The payload is encoded as one string and then split at 61-char label
-		// boundaries; concatenating the labels restores the exact encoded form,
-		// so the parser can decode them as a single run.
-		enc := dnsTunnelB32.EncodedLen(len(data))
-		encBuf := make([]byte, enc)
+
+	if enc > 0 {
+		encPooled := queryEncodingBufferPool.Get().(*[]byte)
+		encBuf := (*encPooled)[:0]
+		if cap(encBuf) < enc {
+			encBuf = make([]byte, enc)
+		} else {
+			encBuf = encBuf[:enc]
+		}
 		dnsTunnelB32.Encode(encBuf, data)
-		for i := 0; i < enc; i += 61 {
-			end := i + 61
+		for i := 0; i < enc; i += dnsTunnelPayloadLabelChars {
+			end := i + dnsTunnelPayloadLabelChars
 			if end > enc {
 				end = enc
 			}
 			buf = append(buf, encBuf[i:end]...)
 			buf = append(buf, '.')
 		}
-		// Every label above already ends with its separator dot, so the marker
-		// can follow directly; the empty-payload case below relies on the dot
-		// the head left after dataSeq.
+		if cap(encBuf) <= 512 {
+			*encPooled = encBuf[:0]
+			queryEncodingBufferPool.Put(encPooled)
+		}
 	}
+
 	buf = append(buf, marker...)
 	buf = append(buf, '.')
 	buf = append(buf, domain...)
+	if randomCase {
+		randomizeQNameCaseBytes(buf)
+	}
 	name := string(buf)
 	if cap(buf) <= 512 {
 		*pooled = buf[:0]

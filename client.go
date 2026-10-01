@@ -781,10 +781,9 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 // server's larger answers instead of truncating them at 512.
 func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
 	seq := atomic.AddUint32(&t.seq, 1)
-	name := buildQueryName(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
-	// 0x20-style QNAME case randomization: the parser folds case, resolvers and
-	// firewalls see per-query entropy that real stub clients also produce.
-	name = qnameRandomCase(name)
+	// Build and 0x20-randomize in one mutable buffer so the hot path pays
+	// for only one final []byte -> string conversion.
+	name := buildQueryNameRandomized(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
 
 	m := new(dns.Msg)
 	m.SetQuestion(name, t.qtype)
@@ -808,27 +807,7 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 // semantic for the tunnel parser (Everything is EqualFold + lowercase).
 func qnameRandomCase(name string) string {
 	b := []byte(name)
-	// One CSPRNG draw covers every letter: a per-character crypto/rand read is
-	// a syscall each, and this runs on the hot path of every single query.
-	// Query names are <= 253 octets, so a 32-byte stack buffer (256 coin bits)
-	// always suffices.
-	var coins [32]byte
-	n := (len(b) + 7) / 8
-	if n > len(coins) {
-		n = len(coins)
-	}
-	if _, err := crand.Read(coins[:n]); err != nil {
-		return string(b)
-	}
-	bit := 0
-	for i := range b {
-		if b[i] >= 'a' && b[i] <= 'z' {
-			if coins[bit>>3]&(1<<(bit&7)) != 0 {
-				b[i] ^= 0x20
-			}
-			bit++
-		}
-	}
+	randomizeQNameCaseBytes(b)
 	return string(b)
 }
 
