@@ -1,0 +1,60 @@
+name: Diagnose QNAME budget
+
+on:
+  push:
+    branches:
+      - perf/throughput-pipeline
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        qname: [203, 211, 219, 227, 235, 243, 251]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/throughput-pipeline
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: Patch client to dynamic chunk and set QNAME cap
+        shell: bash
+        env:
+          QNAME_CAP: ${{ matrix.qname }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path('client.go')
+          s = p.read_text()
+          start = s.index('// setChunkSize re-sizes upstream chunks to the multi-label capacity')
+          end = s.index('\n}\n', start) + 3
+          replacement = '''// setChunkSize re-sizes upstream chunks to the largest multi-label payload
+          // that fits the configured DNS QNAME safety budget.
+          func (t *DNSClientTunnel) setChunkSize() {
+          \tnoise := t.noiseSession != nil && t.noiseSession.SendCipher != nil
+          \tchunk := maxUpstreamPlainChunk(t.domain, t.marker, t.session, noise)
+          \tif chunk > 0 {
+          \t\tt.chunkSize = chunk
+          \t}
+          }
+          '''
+          p.write_text(s[:start] + replacement + s[end:])
+
+          q = Path('upstream_chunk.go')
+          qs = q.read_text()
+          qs = qs.replace('dnsTunnelMaxQNameTextLen = 253', f'dnsTunnelMaxQNameTextLen = {os.environ["QNAME_CAP"]}')
+          q.write_text(qs)
+          PY
+          gofmt -w client.go upstream_chunk.go
+      - name: Concurrent Noise transfer
+        run: timeout 75s go test -count=1 -run '^TestConcurrentNoiseTransfer$' -timeout 60s .
+      - name: CLI UDP forward
+        run: timeout 75s go test -count=1 -run '^TestRunUDPForwardClientLoop$' -timeout 60s ./cmd/dns_custom
