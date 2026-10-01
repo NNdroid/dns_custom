@@ -1263,8 +1263,8 @@ func (t *DNSClientTunnel) waitTimer(timer *time.Timer, d time.Duration) bool {
 }
 
 // kickPollers wakes one idle poller so freshly written upstream data and its
-// downstream answer are fetched within a round trip instead of after up to a
-// full poll interval. Non-blocking: tokens coalesce while pollers are busy.
+// downstream answer are fetched within one RTT instead of after up to a full
+// poll interval. Non-blocking: tokens coalesce while pollers are busy.
 func (t *DNSClientTunnel) kickPollers() {
 	select {
 	case t.pollKick <- struct{}{}:
@@ -1733,25 +1733,17 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 	return "", fmt.Errorf("dnstunnel: target declaration failed after %d attempts: %w", dnsTunnelTargetAttempts, lastErr)
 }
 
-// setChunkSize re-sizes upstream chunks to the multi-label capacity, provided
-// the session's worst-case query name still fits the DNS 255-octet name limit.
+// setChunkSize expands upstream data chunks to the largest payload that fits the
+// complete DNS QNAME. Old servers never reach this capability path, so they keep
+// the legacy single-label 32/22-byte chunk size for compatibility.
 func (t *DNSClientTunnel) setChunkSize() {
-	worst := len(t.session) + 1 + // session.
-		10 + 1 + // seq.
-		10 + 1 + // ack.
-		1 + 1 + // flag.
-		10 + 1 + // dataSeq.
-		123 + // two 61-char data labels plus their separating dot
-		1 + len(dnsTunnelMarker) + 1 + // .tunnel2.
-		len(t.domain) // fqdn domain includes its trailing dot
-	if worst > 253 {
-		t.log.Warnf("Domain too long for multi-label queries; staying on single-label chunk size")
+	noise := t.noiseSession != nil && t.noiseSession.SendCipher != nil
+	chunk := maxUpstreamChunkSize(t.domain, t.session, t.marker, noise)
+	if chunk <= 0 {
+		t.log.Warnf("Domain/marker leave no safe multi-label payload budget; staying on legacy chunk size %d", t.chunkSize)
 		return
 	}
-	t.chunkSize = 2 * 61 * 5 / 8 // two labels of base32 carry 76 wire bytes
-	if t.noiseSession != nil {
-		t.chunkSize -= noiseTagSize
-	}
+	t.chunkSize = chunk
 }
 
 // Transport reports the backend transport the server confirmed for this session
