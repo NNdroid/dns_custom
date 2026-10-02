@@ -24,7 +24,9 @@ jobs:
   benchmark:
     name: Throughput baseline vs head
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
+      GOMAXPROCS: '2'
       BENCHTIME: ${{ inputs.benchtime || '2s' }}
       BENCHCOUNT: ${{ inputs.count || '7' }}
       BENCH_RE: 'BenchmarkUp(UDP|TCP|DoH)Target(TCP|UDP)$'
@@ -33,6 +35,7 @@ jobs:
       - name: Check out head
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
 
       - name: Set up Go
@@ -54,7 +57,7 @@ jobs:
             base_sha="$(git rev-parse origin/main)"
           fi
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
-          echo "Comparing base $base_sha with head $GITHUB_SHA"
+          echo "Comparing base $base_sha with head $(git rev-parse HEAD)"
 
       - name: Create base worktree
         shell: bash

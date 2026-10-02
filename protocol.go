@@ -237,8 +237,8 @@ func fitDownstreamPayload(nameLen int, n int, qtype uint16) int {
 
 // fitDownstreamPayloadBudget is fitDownstreamPayload with a caller-supplied
 // response budget and query-name length — the EDNS0 path passes the negotiated
-// UDP size instead of 512, and the server passes the session's longest observed
-// query name so every chunk fits any query it may be retransmitted in.
+// UDP size instead of 512. Reliable retransmits that do not fit the current
+// query wait for a later shorter query (normally a poll).
 func fitDownstreamPayloadBudget(nameLen int, n int, qtype uint16, udpBudget int) int {
 	if n <= 0 {
 		return 0
@@ -263,10 +263,8 @@ func fitDownstreamPayloadBudget(nameLen int, n int, qtype uint16, udpBudget int)
 	return low
 }
 
-// dnsTunnelNameReserve covers small query-name growth within a session after
-// the longest name was observed (sequence numbers gaining a digit, overhead
-// drift). The large delta between data and poll names is handled exactly by
-// sizing chunks against the longest observed name.
+// dnsTunnelNameReserve leaves room for modest query-name growth (sequence
+// numbers gaining a digit). Larger changes are checked before retransmission.
 const dnsTunnelNameReserve = 2 * 8
 
 // maxDownstreamPayload is the largest plaintext payload one answer may carry: the
@@ -278,8 +276,8 @@ func maxDownstreamPayload(qtype uint16, noise bool, nameLen int) int {
 
 func maxDownstreamPayloadBudget(qtype uint16, noise bool, nameLen int, udpBudget int) int {
 	capacity := downstreamCapBudget(qtype, noise, udpBudget)
-	// Every chunk must be deliverable under ANY query name it may later be
-	// retransmitted in, not just the one that triggered its creation.
+	// Size fresh chunks for this response. Stored chunks that do not fit a
+	// later query remain queued until a query with enough space arrives.
 	udpBudget -= dnsTunnelNameReserve
 	overhead := 0
 	switch {

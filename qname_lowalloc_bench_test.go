@@ -20,7 +20,7 @@ func TestBuildQueryNameRandomizedRoundTrip(t *testing.T) {
 }
 
 func BenchmarkQNameHotPath(b *testing.B) {
-	payload := make([]byte, 128)
+	payload := make([]byte, 96)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()

@@ -59,3 +59,39 @@ func TestOversizedRetransmitWaitsForShortPoll(t *testing.T) {
 		t.Fatal("short poll could not retransmit queued downstream chunk")
 	}
 }
+
+func TestEncryptedRetransmitPreservesChunkAcrossQNameBudgets(t *testing.T) {
+	key := bytes.Repeat([]byte{0x42}, 32)
+	send, err := newNoiseCipherState(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recv, err := newNoiseCipherState(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newDnsSession("0123456789abcdef", "tcp", "127.0.0.1:1", false, &NoiseSession{SendCipher: send}, nopLogger, nil)
+	payload := bytes.Repeat([]byte{0xa5}, 160)
+	if !s.pushServer(payload) {
+		t.Fatal("pushServer rejected payload")
+	}
+	first := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	seq, _, encrypted, ok := decodeDownstreamFrame(first)
+	if !ok {
+		t.Fatal("short poll did not create a framed chunk")
+	}
+	plain, err := recv.Decrypt(uint64(seq), encrypted)
+	if err != nil || !bytes.Equal(plain, payload) {
+		t.Fatalf("encrypted payload mismatch: %v", err)
+	}
+	queuedBytes := s.serverOutBytes
+	for i := 0; i < 5; i++ {
+		if got := s.serveDownstream(dns.TypeTXT, 251, dnsTunnelMaxUDPResponse); len(got) != 0 {
+			t.Fatal("long QNAME emitted oversized encrypted retransmit")
+		}
+	}
+	retry := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	if !bytes.Equal(first, retry) || s.serverOutBytes != queuedBytes || len(s.serverOut) != 1 {
+		t.Fatal("deferring retransmit changed ciphertext or retransmission state")
+	}
+}

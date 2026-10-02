@@ -1,8 +1,12 @@
 package dnstunnel
 
 import (
+	"bytes"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/miekg/dns"
 )
 
 func upstreamQNameLen(domain, marker, session string, plain int, noise bool) int {
@@ -11,6 +15,60 @@ func upstreamQNameLen(domain, marker, session string, plain int, noise bool) int
 		wire += noiseTagSize
 	}
 	return len(buildQueryName(marker, domain, session, ^uint32(0), ^uint32(0), ^uint32(0), flagData, make([]byte, wire)))
+}
+
+// Exercise every remaining QNAME budget, including the point where an AEAD
+// tag leaves no room for data. Pack and parse actual worst-case DNS questions
+// so the test also checks label separators and the wire-format size ceiling.
+func TestUpstreamChunkWireBoundaries(t *testing.T) {
+	const session = "0123456789abcdef"
+	for domainLen := 1; domainLen <= 190; domainLen++ {
+		var labels []string
+		for remaining := domainLen; remaining > 0; {
+			n := remaining
+			if n > 50 {
+				n = 50
+			}
+			labels = append(labels, strings.Repeat("a", n))
+			remaining -= n
+		}
+		domain := strings.Join(labels, ".") + "."
+		for _, marker := range []string{dnsTunnelMarker, "custommarker"} {
+			for _, noise := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%d/%s/noise=%t", domainLen, marker, noise), func(t *testing.T) {
+					n := maxUpstreamPlainChunk(domain, marker, session, noise)
+					if n == 0 {
+						if upstreamQNameLen(domain, marker, session, 1, noise) <= dnsTunnelMaxQNameTextLen {
+							t.Fatal("one-byte payload fits but chunk size is zero")
+						}
+						return
+					}
+					wireSize := n
+					if noise {
+						wireSize += noiseTagSize
+					}
+					payload := bytes.Repeat([]byte{0xa5}, wireSize)
+					name := buildQueryNameRandomized(marker, domain, session, ^uint32(0), ^uint32(0), ^uint32(0), flagData, payload)
+					if len(name) > dnsTunnelMaxQNameTextLen || upstreamQNameLen(domain, marker, session, n+1, noise) <= dnsTunnelMaxQNameTextLen {
+						t.Fatalf("chunk %d does not maximize safe QNAME budget", n)
+					}
+					msg := new(dns.Msg)
+					msg.SetQuestion(name, dns.TypeTXT)
+					packed, err := msg.Pack()
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(packed)-12-4 > 255 {
+						t.Fatalf("wire QNAME exceeds 255 bytes: %d", len(packed)-12-4)
+					}
+					_, _, _, _, _, got, err := parseQueryNameForMarkers(domain, len(labels), name, markerSetFor(marker))
+					if err != nil || !bytes.Equal(got, payload) {
+						t.Fatalf("payload roundtrip failed: %v", err)
+					}
+				})
+			}
+		}
+	}
 }
 
 func TestMaxUpstreamPlainChunkUsesMultiLabelBudget(t *testing.T) {

@@ -290,7 +290,6 @@ type dnsSession struct {
 	serverOutBytes   int                         // total ciphertext bytes held in serverOut (caller holds mu)
 	serverSkipTo     uint32                      // >0 once chunks were abandoned: client must expect this seq
 	downstreamWindow int32                       // atomic; advertised client window, default dnsTunnelDownstreamWindow
-	maxQnameLen      int                         // longest query name seen this session; chunks are sized to fit it
 }
 
 // downstreamChunk is one un-acked downstream chunk. ct is the payload as it goes on
@@ -897,21 +896,6 @@ func (s *dnsSession) setTarget(network, addr string) (byte, string) {
 	return targetStatusOK, network
 }
 
-// noteQnameLen records the longest query name observed for this session and
-// returns it. Chunks are always sized against the longest name: a chunk created
-// for a short poll may be retransmitted inside a much longer data query's
-// answer, and an oversized response is dropped by the client's UDP buffer —
-// that drop was a permanent retransmit loop with multi-label data names.
-func (s *dnsSession) noteQnameLen(l int) int {
-	s.mu.Lock()
-	if l > s.maxQnameLen {
-		s.maxQnameLen = l
-	}
-	longest := s.maxQnameLen
-	s.mu.Unlock()
-	return longest
-}
-
 // setDownstreamWindow records a client-advertised downstream window (carried in
 // the poll's dataSeq). Clamped so a single session cannot inflate its
 // retransmission buffer beyond the shared bound.
@@ -1283,7 +1267,6 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		udpBudget = dnsTunnelMaxUDPResponse
 	}
 
-	sess.noteQnameLen(len(q.Name))
 	downstreamData := sess.serveDownstream(q.Qtype, len(q.Name), udpBudget)
 	if len(downstreamData) > 0 {
 		rr := makeAnswer(q.Name, q.Qtype, downstreamData, s.domain)
