@@ -32,10 +32,17 @@ curl -fsSL https://raw.githubusercontent.com/NNdroid/dns_custom/master/scripts/i
 ```
 
 ### 3. Pin a Release Version (Optional)
+
+To publish without calculating a tag, open GitHub **Actions → Release → Run
+workflow**, select the branch and leave **publish_release** checked (the default).
+After tests and builds pass, the workflow creates the Git-derived version tag
+and publishes the binaries. Uncheck it for an artifact-only build. The run
+summary shows the version and exact commit; manual runs also retain artifacts.
+
 Leave `APP_VERSION` unset to install the latest release. To install a specific
-raw-binary release, supply its tag (`v1.0.yyyyMMdd-<7-character-git-hash>`):
+raw-binary release, supply its tag (`v1.0.yyyyMMdd.<commit-count>-<7-character-git-hash>`):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NNdroid/dns_custom/master/scripts/install.sh | sudo env APP_VERSION=v1.0.20260904-1a2b3c4 bash -s install server
+curl -fsSL https://raw.githubusercontent.com/NNdroid/dns_custom/master/scripts/install.sh | sudo env APP_VERSION=v1.0.20260904.123-1a2b3c4 bash -s install server
 ```
 
 ### 4. Upgrade / Uninstall
@@ -305,5 +312,5 @@ go test -race ./...  # with race detector (needs CGO and a C toolchain)
 
 CI (`.github/workflows/test.yml`) runs vet plus plain and race-enabled tests
 on Linux, macOS and Windows for every push and pull request. Pushing a
-`v1.0.yyyyMMdd-<short-sha>` tag triggers `.github/workflows/release.yml`,
+`v1.0.yyyyMMdd.<commit-count>-<short-sha>` tag triggers `.github/workflows/release.yml`,
 which re-runs the tests and publishes raw binaries for 9 platforms.
