@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/miekg/dns"
 	"testing"
@@ -35,20 +36,33 @@ func collectClientEvents() (ClientEventHandler, func() []ClientEvent) {
 	return handler, read
 }
 
-// TestClientEventsLifecycle walks a full session against {dead, live} servers:
-// the dead path forces a Reconnecting retry, the live path establishes the
-// session, and an explicit Close fires TunnelDied — in order, on the handler.
+// TestClientEventsLifecycle injects one failed DATA exchange, verifies that its
+// retry publishes Reconnecting and delivers the payload, then closes the session
+// to publish TunnelDied. Poll scheduling cannot consume the injected failure.
 func TestClientEventsLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	backend := startTCPEchoBackend(t)
-	liveDNS := startTestDNSServer(t, mustDNSServerForEvents(t, "events.test.local", "tcp://"+backend))
-	deadDNS := "127.0.0.1:1"
+	const domain = "events.test.local"
+	srv := mustDNSServerForEvents(t, domain, "tcp://"+backend)
+	var failed atomic.Bool
+	liveDNS := startTestDNSServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) > 0 {
+			_, _, _, _, flag, data, err := parseQueryName(domain, req.Question[0].Name)
+			if err == nil && flag == flagData && len(data) > 0 && failed.CompareAndSwap(false, true) {
+				reply := new(dns.Msg)
+				reply.SetRcode(req, dns.RcodeServerFailure)
+				_ = w.WriteMsg(reply)
+				return
+			}
+		}
+		srv.ServeDNS(w, req)
+	}))
 	handler, readEvents := collectClientEvents()
 	cli, err := NewClient(ClientConfig{
 		Domain:       "events.test.local",
-		Servers:      []string{deadDNS, liveDNS},
+		Servers:      []string{liveDNS},
 		RecordType:   "txt",
 		EventHandler: handler,
 	})
@@ -60,11 +74,11 @@ func TestClientEventsLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
+	defer conn.Close()
+	if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
 
-	// 4 chunks × 21 bytes: round-robin must hand at least one to the dead
-	// path no matter where the cursor starts after the capability probe, and
-	// that chunk pays a full UDP timeout before its retry succeeds on the
-	// live path — which is what fires Reconnecting.
 	payload := bytes.Repeat([]byte("event lifecycle probe"), 4)
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatalf("write: %v", err)
@@ -80,19 +94,21 @@ func TestClientEventsLifecycle(t *testing.T) {
 		t.Fatal("roundtrip mismatch")
 	}
 
-	// The first chunk round-robins onto the dead path and pays a full UDP
-	// timeout before its retry succeeds on the live one; wait for that
-	// Reconnecting event instead of a fixed sleep, then close to fire
-	// TunnelDied.
-	waitForEvent(t, readEvents, ClientReconnecting, 20*time.Second)
+	if !failed.Load() {
+		t.Fatal("DATA failure was not injected")
+	}
+	waitForEvent(t, readEvents, ClientReconnecting, 5*time.Second)
 	_ = conn.Close()
 	waitForEvent(t, readEvents, ClientTunnelDied, 5*time.Second)
 
 	// The snapshot accumulates every event ever published — assert the full
 	// lifecycle was seen, and that Died reported the actual close reason.
-	seen := map[ClientEventKind]bool{ClientReconnecting: true, ClientTunnelDied: true}
+	seen := make(map[ClientEventKind]bool)
 	for _, ev := range readEvents() {
 		seen[ev.Kind] = true
+		if ev.Kind == ClientReconnecting && (ev.Attempt != 1 || ev.Err == nil) {
+			t.Fatalf("retry event = %+v, want first attempt with an error", ev)
+		}
 		if ev.Kind == ClientTunnelDied && ev.Reason != deathReasonCallerClosed {
 			t.Fatalf("died reason = %q, want %q", ev.Reason, deathReasonCallerClosed)
 		}
