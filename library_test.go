@@ -63,16 +63,27 @@ func startUDPEchoBackend(t *testing.T) string {
 	return conn.LocalAddr().String()
 }
 
-// pickFreeUDPPort reserves an ephemeral UDP port for the tunnel server.
+// pickFreeUDPPort finds an ephemeral port usable by both listeners in
+// Server.Run. A free UDP port can be occupied or excluded for TCP on Windows.
 func pickFreeUDPPort(t *testing.T) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port failed: %v", err)
+	for attempt := 0; attempt < 100; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve TCP port failed: %v", err)
+		}
+		addr := ln.Addr().String()
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			_ = ln.Close()
+			continue
+		}
+		_ = pc.Close()
+		_ = ln.Close()
+		return addr
 	}
-	addr := pc.LocalAddr().String()
-	_ = pc.Close()
-	return addr
+	t.Fatal("could not find a port available for both UDP and TCP")
+	return ""
 }
 
 // waitForDNSServer polls until the tunnel DNS listener answers, so tests that
