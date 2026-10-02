@@ -781,10 +781,9 @@ func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 // server's larger answers instead of truncating them at 512.
 func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
 	seq := atomic.AddUint32(&t.seq, 1)
-	name := buildQueryName(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
-	// 0x20-style QNAME case randomization: the parser folds case, resolvers and
-	// firewalls see per-query entropy that real stub clients also produce.
-	name = qnameRandomCase(name)
+	// Build and 0x20-randomize in one mutable buffer so the hot path pays
+	// for only one final []byte -> string conversion.
+	name := buildQueryNameRandomized(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
 
 	m := new(dns.Msg)
 	m.SetQuestion(name, t.qtype)
@@ -808,27 +807,7 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 // semantic for the tunnel parser (Everything is EqualFold + lowercase).
 func qnameRandomCase(name string) string {
 	b := []byte(name)
-	// One CSPRNG draw covers every letter: a per-character crypto/rand read is
-	// a syscall each, and this runs on the hot path of every single query.
-	// Query names are <= 253 octets, so a 32-byte stack buffer (256 coin bits)
-	// always suffices.
-	var coins [32]byte
-	n := (len(b) + 7) / 8
-	if n > len(coins) {
-		n = len(coins)
-	}
-	if _, err := crand.Read(coins[:n]); err != nil {
-		return string(b)
-	}
-	bit := 0
-	for i := range b {
-		if b[i] >= 'a' && b[i] <= 'z' {
-			if coins[bit>>3]&(1<<(bit&7)) != 0 {
-				b[i] ^= 0x20
-			}
-			bit++
-		}
-	}
+	randomizeQNameCaseBytes(b)
 	return string(b)
 }
 
@@ -1733,25 +1712,18 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 	return "", fmt.Errorf("dnstunnel: target declaration failed after %d attempts: %w", dnsTunnelTargetAttempts, lastErr)
 }
 
-// setChunkSize re-sizes upstream chunks to the multi-label capacity, provided
-// the session's worst-case query name still fits the DNS 255-octet name limit.
+// setChunkSize expands upstream DATA chunks to the largest multi-label payload
+// that fits the DNS QNAME safety budget. Old servers that do not answer the
+// capability/target probe never call this method, preserving the historical
+// conservative 32-byte (22-byte with Noise) fallback.
 func (t *DNSClientTunnel) setChunkSize() {
-	worst := len(t.session) + 1 + // session.
-		10 + 1 + // seq.
-		10 + 1 + // ack.
-		1 + 1 + // flag.
-		10 + 1 + // dataSeq.
-		123 + // two 61-char data labels plus their separating dot
-		1 + len(dnsTunnelMarker) + 1 + // .tunnel2.
-		len(t.domain) // fqdn domain includes its trailing dot
-	if worst > 253 {
-		t.log.Warnf("Domain too long for multi-label queries; staying on single-label chunk size")
+	noise := t.noiseSession != nil && t.noiseSession.SendCipher != nil
+	chunk := maxUpstreamPlainChunk(t.domain, t.marker, t.session, noise)
+	if chunk <= 0 {
+		t.log.Warnf("Domain/marker too long for expanded multi-label queries; staying on conservative chunk size")
 		return
 	}
-	t.chunkSize = 2 * 61 * 5 / 8 // two labels of base32 carry 76 wire bytes
-	if t.noiseSession != nil {
-		t.chunkSize -= noiseTagSize
-	}
+	t.chunkSize = chunk
 }
 
 // Transport reports the backend transport the server confirmed for this session
