@@ -27,13 +27,13 @@ import (
 // (http.Transport.TLSClientConfig) instead of being silently dropped.
 func TestTLSConfigPropagation(t *testing.T) {
 	marker := &tls.Config{MinVersion: tls.VersionTLS12}
-	path := newDNSPath("dot://127.0.0.1:853", nil, marker)
+	path := newDNSPath("dot://127.0.0.1:853", nil, marker, dnsTunnelExchangeTimeout)
 	defer path.close()
 	if path.dnsCli == nil || path.dnsCli.TLSConfig != marker {
 		t.Fatal("custom tls.Config was not propagated to the DoT client")
 	}
 
-	doh := newDNSPath("https://resolver.example/dns-query", nil, marker)
+	doh := newDNSPath("https://resolver.example/dns-query", nil, marker, dnsTunnelExchangeTimeout)
 	defer doh.close()
 	if doh.httpCli == nil {
 		t.Fatal("DoH client missing")
@@ -45,7 +45,7 @@ func TestTLSConfigPropagation(t *testing.T) {
 		t.Fatal("custom tls.Config was not propagated to the DoH transport")
 	}
 
-	plain := newDNSPath("udp://127.0.0.1:53", nil, marker)
+	plain := newDNSPath("udp://127.0.0.1:53", nil, marker, dnsTunnelExchangeTimeout)
 	defer plain.close()
 	if plain.dnsCli == nil || plain.dnsCli.TLSConfig != marker {
 		t.Fatal("tls.Config not stored on plain-UDP path (harmless, but must be consistent)")

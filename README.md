@@ -74,8 +74,10 @@ journalctl -u dns_custom -f   # View live logs
 | `target` | `string` | `"tcp://127.0.0.1:22"` | Server: default backend (`tcp://host:port` or `udp://host:port`). Client: optional backend declaration — must pass the server's `allow_targets` list, or the session is rejected. |
 | `allow_targets` | `array` | `[]` | Server only: patterns granting client-declared targets, e.g. `"tcp://127.0.0.1:*"`, `"udp://10.8.0.*:51820"`; scheme/host/port may each be `*`, host wildcards never cross a dot. Empty = default target only; `"*"` allows everything (dangerous). |
 | `max_sessions` | `int` | `0` | Server only: concurrent session cap (each session holds up to ~600KB of buffers). `0` = unlimited. |
-| `edns0` | `bool` | `false` | Announce 1232-byte UDP answers via EDNS0 instead of the 512-byte limit — much larger downstream chunks. Set on **both** ends or the tunnel stalls. |
+| `edns0` | `bool` | `false` | Announce 1232-byte UDP answers via EDNS0 instead of the 512-byte limit — much larger downstream chunks. Set on **both** ends or the tunnel stalls. **Only takes effect on an authenticated session** (`pubkey`/Noise or `psk`): the server caps anonymous answers at the legacy 512-byte budget so an open deployment cannot be used as a big-pipe amplifier, so setting `edns0` without either buys bytes on every query for no gain and logs a warning. |
 |  |  |  | *Throughput ladder (same server, loopback): plain UDP ≈ 1.6 MB/s, EDNS0 ≈ 2.8 MB/s, `tcp://` upstream ≈ 2.9 MB/s.* |
+| `exchange_timeout` | `duration` | `4s` | Client only: how long one DNS exchange waits for its reply. A lost query burns exactly that much wall clock before the same chunk is retransmitted, so under loss this dominates throughput more than the query rate does. The wait is also clamped down to eight times the session's best observed round trip, floored at 500 ms, so a 200 ms path never spends 20× its RTT discovering one dropped query; a session with no measurement yet waits the floor, not the ceiling. Lower it to fail over a dead upstream faster, raise it for a very janky path. |
+| `poll_interval` | `duration` | `50ms` | Client only: how often a downstream poll is sent when there is nothing queued. Downstream bytes arrive only as answers to the client's own polls, so on a clean path this interval — not bandwidth, not chunk size — sets the read rate. Lower it to trade idle DNS queries for lower read latency. |
 | `domain` | `string` | `""` | Authoritative DNS tunnel domain (e.g. `tunnel.example.com`). |
 | `privkey` | `string` | `""` | Server static private key for Noise encryption (Hex or Base64). Generate with `dns_custom gen-keys`. |
 | `pubkey` | `string` | `""` | Server static public key for Noise encryption in client mode (Hex or Base64). |
@@ -178,6 +180,8 @@ matching.
 | `DNSCUSTOM_MAX_SESSIONS` | `max_sessions` |
 | `DNSCUSTOM_EDNS0` | `edns0` (`1`/`true`/`yes`/`on`) |
 | `DNSCUSTOM_LOG_LEVEL` | `log_level` |
+| `DNSCUSTOM_EXCHANGE_TIMEOUT` | `exchange_timeout` (Go duration, e.g. `1s`, `800ms`) |
+| `DNSCUSTOM_POLL_INTERVAL` | `poll_interval` (Go duration, e.g. `25ms`) |
 
 ---
 
@@ -212,6 +216,18 @@ cli, err := dnstunnel.NewClient(dnstunnel.ClientConfig{
 
 conn, err := cli.Dial(ctx)     // stream access → net.Conn
 pconn, err := cli.DialUDP(ctx) // datagram access → net.PacketConn
+
+// Both ends tune themselves to the path by default: the DNS exchange wait
+// clamps down to the measured round trip, and the poll cadence sets the clean
+// path's read rate. Override either in ClientConfig when a specific link needs
+// it:
+cli, _ = dnstunnel.NewClient(dnstunnel.ClientConfig{
+	Domain:     "tunnel.example.com",
+	Servers:    []string{"8.8.8.8:53"},
+	RecordType: "txt",
+	ExchangeTimeout: 1 * time.Second, // fail over a dead upstream sooner
+	PollInterval:    20 * time.Millisecond, // lower read latency, more DNS traffic
+})
 
 // Optionally declare which backend to reach; the server validates it against
 // its allow_targets list. Without a declaration, ask the server what its
@@ -342,11 +358,32 @@ iteration) and `window` (the adaptive in-flight window it settled at).
 Loss and duplication are applied per leg, so a 10 % link still lets 91.8 % of
 a round trip through. Payload size is tuned per profile rather than shared: the
 client retransmits a lost chunk only after its DNS query times out, and that
-timeout is a fixed 4 s regardless of the path's latency, so a high-loss profile
-carries fewer chunks. The relay's own knobs are pinned by
+wait — a 4 s ceiling clamped down to eight times the measured round trip, with
+a 500 ms floor — is what a high-loss profile spends most of its time in. The
+relay's own knobs are pinned by
 `TestWeakLinkAppliesEveryDegradationMode`, `TestWeakLinkInjectsDelayAndReorder`
 and `TestWeakLinkRateLimits`, which check each degradation against the wire
 instead of trusting the injection code by convention.
+
+Reference sweep on a 32-core runner (`benchtime 3x`, ~1 KiB per iteration):
+
+| profile    | goodput | retries | window |
+|------------|---------|---------|--------|
+| `clean`    | 0.19 MB/s | 0    | 14 |
+| `3g`       | 0.00 MB/s | 0.67  | 9  |
+| `4g`       | 0.00 MB/s | 0.33  | 4  |
+| `badWifi`  | 0.00 MB/s | 0     | 12 |
+| `congested` | 0.00 MB/s | 0    | 12 |
+| `lossy`    | 0.00 MB/s | 2.67  | 6  |
+| `reordered` | 0.00 MB/s | 5.00 | 4  |
+| `duplicated` | 0.01 MB/s | 0   | 13 |
+| `2mbit`    | 0.04 MB/s | 0     | 4  |
+| `512kbit`  | 0.01 MB/s | 0     | 4  |
+
+Before the adaptive exchange wait, the same sweep measured 1.85 s for `clean`,
+4.61 s for `3g`, 2.57 s for `4g`, 6.44 s for `congested` and 3.64 s for
+`lossy`; it now measures 0.18 s, 2.97 s, 2.22 s, 4.21 s and 1.81 s
+respectively.
 
 ### CI
 

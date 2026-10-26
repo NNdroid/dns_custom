@@ -42,6 +42,12 @@ type Config struct {
 	Servers      []string `json:"-"`             // Parsed upstream DNS servers
 	RecordType   string   `json:"record_type"`   // DNS record type: txt, null, cname, a, aaaa, mx, srv, ns
 	LogLevel     string   `json:"log_level"`     // debug, info, warn, error
+	// ExchangeTimeout caps how long one DNS exchange waits for its reply; a lost
+	// query costs that much wall clock before retransmit. 0 = default.
+	ExchangeTimeout time.Duration `json:"exchange_timeout,omitempty"`
+	// PollInterval paces downstream polls that returned no data; it sets the
+	// clean-path read rate. 0 = default.
+	PollInterval time.Duration `json:"poll_interval,omitempty"`
 }
 
 func (c *Config) UnmarshalJSON(data []byte) error {
@@ -148,6 +154,16 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := getEnv("DNSCUSTOM_LOG_LEVEL", "LOG_LEVEL", "LOGLEVEL"); v != "" {
 		cfg.LogLevel = v
+	}
+	if v := getEnv("DNSCUSTOM_EXCHANGE_TIMEOUT", "EXCHANGE_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.ExchangeTimeout = d
+		}
+	}
+	if v := getEnv("DNSCUSTOM_POLL_INTERVAL", "POLL_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.PollInterval = d
+		}
 	}
 }
 
@@ -381,13 +397,15 @@ func buildServerConfig(cfg *Config) dnstunnel.ServerConfig {
 
 func buildClientConfig(cfg *Config) dnstunnel.ClientConfig {
 	cc := dnstunnel.ClientConfig{
-		Domain:     cfg.Domain,
-		Servers:    cfg.Servers,
-		RecordType: cfg.RecordType,
-		PublicKey:  cfg.PubKey,
-		Target:     cfg.Target,
-		EDNS0:      cfg.EDNS0,
-		Logger:     zlog,
+		Domain:          cfg.Domain,
+		Servers:         cfg.Servers,
+		RecordType:      cfg.RecordType,
+		PublicKey:       cfg.PubKey,
+		Target:          cfg.Target,
+		EDNS0:           cfg.EDNS0,
+		Logger:          zlog,
+		ExchangeTimeout: cfg.ExchangeTimeout,
+		PollInterval:    cfg.PollInterval,
 	}
 	if cc.RecordType == "" {
 		cc.RecordType = "txt"

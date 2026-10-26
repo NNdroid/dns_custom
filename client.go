@@ -119,7 +119,7 @@ func validateDNSResponse(resp *dns.Msg) error {
 	return nil
 }
 
-func newDNSPath(server string, dialer *net.Dialer, tlsConfig *tls.Config) *dnsPath {
+func newDNSPath(server string, dialer *net.Dialer, tlsConfig *tls.Config, exchangeTimeout time.Duration) *dnsPath {
 	p := &dnsPath{
 		server: server,
 		pool:   make(chan *pooledConn, dnsTunnelConnPool),
@@ -145,13 +145,13 @@ func newDNSPath(server string, dialer *net.Dialer, tlsConfig *tls.Config) *dnsPa
 		if tlsConfig != nil {
 			transport.TLSClientConfig = tlsConfig.Clone()
 		}
-		p.httpCli = &http.Client{Transport: transport, Timeout: 4 * time.Second}
+		p.httpCli = &http.Client{Transport: transport, Timeout: exchangeTimeout}
 	} else {
 		// Read buffers must cover EDNS0-sized answers when the session
 		// negotiates them; a buffer at the legacy 512 would truncate every
 		// large answer into a permanent retransmit loop. Sizing it
 		// unconditionally is harmless for smaller responses.
-		p.dnsCli = &dns.Client{Net: p.network, Timeout: 4 * time.Second, Dialer: dialer, UDPSize: dnsTunnelEDNS0UDPSize, TLSConfig: tlsConfig}
+		p.dnsCli = &dns.Client{Net: p.network, Timeout: exchangeTimeout, Dialer: dialer, UDPSize: dnsTunnelEDNS0UDPSize, TLSConfig: tlsConfig}
 	}
 	return p
 }
@@ -318,6 +318,18 @@ type ClientConfig struct {
 	// PSK is the pre-shared secret for client authentication on servers with
 	// psks configured. Empty = anonymous (refused by PSK servers).
 	PSK string `json:"psk,omitempty"`
+	// ExchangeTimeout caps how long one DNS exchange waits for its reply. Zero
+	// uses the default. A lost query costs that much wall clock before the
+	// same chunk is retransmitted, so it dominates throughput under loss. The
+	// wait is additionally clamped down to ExchangeTimeoutRTTFactor times the
+	// session's best observed round trip, floored at 500ms, once the round trip
+	// is known - see adaptiveExchangeTimeout.
+	ExchangeTimeout time.Duration `json:"exchange_timeout,omitempty"`
+	// PollInterval paces downstream polls that returned no data. Zero uses the
+	// default. Downstream bytes only arrive as answers to the client's own
+	// polls, so on a clean path this interval sets the transfer rate; a lower
+	// value trades idle DNS queries for lower read latency.
+	PollInterval time.Duration `json:"poll_interval,omitempty"`
 }
 
 // Client is the library entry point for dialing out through the DNS tunnel. One
@@ -325,20 +337,22 @@ type ClientConfig struct {
 // DialTarget / DialUDPTarget declare the backend per session instead of per
 // client.
 type Client struct {
-	servers      []string
-	domain       string
-	recordType   string
-	publicKey    string
-	target       string
-	edns0        bool
-	log          *zap.SugaredLogger
-	dialer       *net.Dialer
-	tlsConfig    *tls.Config
-	eventHandler ClientEventHandler
-	marker       string
-	pskKey       []byte
-	events       *eventDispatcher[ClientEvent]
-	evMu         sync.Mutex // guards eventHandler + lazy events creation
+	servers         []string
+	domain          string
+	recordType      string
+	publicKey       string
+	target          string
+	edns0           bool
+	log             *zap.SugaredLogger
+	dialer          *net.Dialer
+	tlsConfig       *tls.Config
+	exchangeTimeout time.Duration
+	pollInterval    time.Duration
+	eventHandler    ClientEventHandler
+	marker          string
+	pskKey          []byte
+	events          *eventDispatcher[ClientEvent]
+	evMu            sync.Mutex // guards eventHandler + lazy events creation
 }
 
 // SetEventHandler installs or replaces the client event handler (nil disables
@@ -404,20 +418,33 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.EventHandler != nil {
 		events = newEventDispatcher[ClientEvent](cfg.EventHandler)
 	}
+	if cfg.ExchangeTimeout < 0 || cfg.PollInterval < 0 {
+		return nil, fmt.Errorf("dnstunnel: exchange_timeout (%v) and poll_interval (%v) must be zero or positive", cfg.ExchangeTimeout, cfg.PollInterval)
+	}
+	exchangeTimeout := cfg.ExchangeTimeout
+	if exchangeTimeout == 0 {
+		exchangeTimeout = dnsTunnelExchangeTimeout
+	}
+	pollInterval := cfg.PollInterval
+	if pollInterval == 0 {
+		pollInterval = dnsTunnelPollInterval
+	}
 	return &Client{
-		servers:      cfg.Servers,
-		domain:       cfg.Domain,
-		recordType:   cfg.RecordType,
-		publicKey:    cfg.PublicKey,
-		target:       trimmedTarget,
-		edns0:        cfg.EDNS0,
-		log:          log,
-		dialer:       cfg.Dialer,
-		tlsConfig:    cfg.TLSConfig,
-		eventHandler: cfg.EventHandler,
-		pskKey:       pskKeyFromSecret(cfg.PSK),
-		marker:       strings.TrimSpace(cfg.Marker),
-		events:       events,
+		servers:         cfg.Servers,
+		domain:          cfg.Domain,
+		recordType:      cfg.RecordType,
+		publicKey:       cfg.PublicKey,
+		target:          trimmedTarget,
+		edns0:           cfg.EDNS0,
+		exchangeTimeout: exchangeTimeout,
+		pollInterval:    pollInterval,
+		log:             log,
+		dialer:          cfg.Dialer,
+		tlsConfig:       cfg.TLSConfig,
+		eventHandler:    cfg.EventHandler,
+		pskKey:          pskKeyFromSecret(cfg.PSK),
+		marker:          strings.TrimSpace(cfg.Marker),
+		events:          events,
 	}, nil
 }
 
@@ -442,6 +469,11 @@ func validateDeclaredTarget(target string) error {
 	return nil
 }
 
+// options passes the client-level timing knobs to every session it opens.
+func (c *Client) options() []tunnelOption {
+	return []tunnelOption{withExchangeTimeout(c.exchangeTimeout), withPollInterval(c.pollInterval)}
+}
+
 // dialStream opens one stream session declaring the given backend. When the
 // declaration is udp:// the session would be a datagram session — refuse here
 // so the caller gets a clear pointer to the datagram API.
@@ -449,7 +481,7 @@ func (c *Client) dialStream(ctx context.Context, target string) (net.Conn, error
 	if strings.HasPrefix(target, "udp://") {
 		return nil, fmt.Errorf("dnstunnel: declared target %q is udp; use DialUDPTarget", target)
 	}
-	return newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey)
+	return newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey, c.options()...)
 }
 
 // dialDatagram opens one datagram session declaring the given backend.
@@ -457,7 +489,7 @@ func (c *Client) dialDatagram(ctx context.Context, target string) (net.PacketCon
 	if target != "" && !strings.HasPrefix(target, "udp://") {
 		return nil, fmt.Errorf("dnstunnel: declared target %q is tcp; use DialTarget", target)
 	}
-	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, udpSessionPrefix, target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey)
+	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, udpSessionPrefix, target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey, c.options()...)
 	if err != nil {
 		return nil, err
 	}
@@ -527,7 +559,7 @@ func (c *Client) DialUDPTarget(ctx context.Context, target string) (net.PacketCo
 // which local socket to bind. A server that predates target declarations (or
 // refuses the empty declaration) yields an error.
 func (c *Client) DefaultTarget(ctx context.Context) (string, error) {
-	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", "", c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, nil, c.pskKey)
+	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", "", c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, nil, c.pskKey, c.options()...)
 	if err != nil {
 		return "", err
 	}
@@ -555,9 +587,12 @@ type DNSClientTunnel struct {
 	session      string
 	chunkSize    int
 	pollInterval time.Duration
-	log          *zap.SugaredLogger
-	dialer       *net.Dialer
-	tlsConfig    *tls.Config
+	// exchangeTimeout bounds one DNS exchange; adaptiveExchangeTimeout clamps it
+	// down to the session's measured round trip.
+	exchangeTimeout time.Duration
+	log             *zap.SugaredLogger
+	dialer          *net.Dialer
+	tlsConfig       *tls.Config
 
 	paths        []*dnsPath     // one per configured upstream server
 	serverCursor uint32         // atomic; round-robin cursor over upstream servers
@@ -616,7 +651,35 @@ type DNSClientTunnel struct {
 	transport string
 }
 
-func newDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string, sessionPrefix string, declaredTarget string, marker string, edns0 bool, log *zap.SugaredLogger, dialer *net.Dialer, tlsConfig *tls.Config, events *eventDispatcher[ClientEvent], pskKey []byte) (*DNSClientTunnel, error) {
+// tunnelTuning carries the per-session timing knobs that are not part of the
+// public ClientConfig surface.
+type tunnelTuning struct {
+	exchangeTimeout time.Duration
+	pollInterval    time.Duration
+}
+
+// tunnelOption tunes one session. newDNSClientTunnel is package-private, so the
+// knobs stay out of its thirteen-argument list and a new one does not touch every
+// caller.
+type tunnelOption func(*tunnelTuning)
+
+func withExchangeTimeout(d time.Duration) tunnelOption {
+	return func(c *tunnelTuning) {
+		if d > 0 {
+			c.exchangeTimeout = d
+		}
+	}
+}
+
+func withPollInterval(d time.Duration) tunnelOption {
+	return func(c *tunnelTuning) {
+		if d > 0 {
+			c.pollInterval = d
+		}
+	}
+}
+
+func newDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string, sessionPrefix string, declaredTarget string, marker string, edns0 bool, log *zap.SugaredLogger, dialer *net.Dialer, tlsConfig *tls.Config, events *eventDispatcher[ClientEvent], pskKey []byte, opts ...tunnelOption) (*DNSClientTunnel, error) {
 	if domain == "" || len(servers) == 0 {
 		return nil, fmt.Errorf("domain and servers are required")
 	}
@@ -627,37 +690,42 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 	if err != nil {
 		return nil, err
 	}
+	tuning := tunnelTuning{exchangeTimeout: dnsTunnelExchangeTimeout, pollInterval: dnsTunnelPollInterval}
+	for _, o := range opts {
+		o(&tuning)
+	}
 	paths := make([]*dnsPath, 0, len(servers))
 	for _, srv := range servers {
-		paths = append(paths, newDNSPath(srv, dialer, tlsConfig))
+		paths = append(paths, newDNSPath(srv, dialer, tlsConfig, tuning.exchangeTimeout))
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	t := &DNSClientTunnel{
-		ctx:            cctx,
-		cancel:         cancel,
-		servers:        servers,
-		domain:         dns.Fqdn(domain),
-		qtype:          qtype,
-		edns0:          edns0,
-		session:        sessionPrefix + randomSessionID(),
-		declaredTarget: declaredTarget,
-		pskKey:         pskKey,
-		marker:         marker,
-		chunkSize:      dnsTunnelDefaultChunk,
-		pollInterval:   dnsTunnelPollInterval,
-		log:            log,
-		dialer:         dialer,
-		tlsConfig:      tlsConfig,
-		events:         events,
-		doneCh:         make(chan struct{}),
-		inBuf:          new(bytes.Buffer),
-		pollKick:       make(chan struct{}, len(paths)),
-		closeCh:        make(chan struct{}),
-		recvNext:       1,
-		recvOOO:        make(map[uint32][]byte),
-		failUntil:      make([]atomic.Int64, len(servers)),
-		paths:          paths,
-		window:         dnsTunnelUpstreamWindow,
+		ctx:             cctx,
+		cancel:          cancel,
+		servers:         servers,
+		domain:          dns.Fqdn(domain),
+		qtype:           qtype,
+		edns0:           edns0,
+		session:         sessionPrefix + randomSessionID(),
+		declaredTarget:  declaredTarget,
+		pskKey:          pskKey,
+		marker:          marker,
+		chunkSize:       dnsTunnelDefaultChunk,
+		exchangeTimeout: tuning.exchangeTimeout,
+		pollInterval:    tuning.pollInterval,
+		log:             log,
+		dialer:          dialer,
+		tlsConfig:       tlsConfig,
+		events:          events,
+		doneCh:          make(chan struct{}),
+		inBuf:           new(bytes.Buffer),
+		pollKick:        make(chan struct{}, len(paths)),
+		closeCh:         make(chan struct{}),
+		recvNext:        1,
+		recvOOO:         make(map[uint32][]byte),
+		failUntil:       make([]atomic.Int64, len(servers)),
+		paths:           paths,
+		window:          dnsTunnelUpstreamWindow,
 	}
 
 	if pubKeyStr != "" {
@@ -743,6 +811,14 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 		}
 	}
 
+	// An EDNS0 announcement only pays off on an authenticated session: the server
+	// caps anonymous answers at the legacy budget so an open deployment cannot be
+	// used as a big-pipe amplifier. Without Noise or a PSK the larger answer space
+	// is therefore never used, and the announcement only adds bytes to every query.
+	if t.edns0 && !t.edns0Effective() {
+		t.log.Warnf("session %s announces edns0 but is unauthenticated; the server caps its answers at %d bytes, so the larger budget is unused (set pubkey or psk)", t.session, dnsTunnelMaxUDPResponse)
+	}
+
 	// Fire TunnelEstablished now that handshake, declaration and pollers are in
 	// place, and make a context cancellation surface as TunnelDied.
 	if t.events != nil {
@@ -766,6 +842,15 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 // pre-validated Client.
 func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string) (*DNSClientTunnel, error) {
 	return newDNSClientTunnel(ctx, servers, domain, recordType, pubKeyStr, "", "", "", false, nopLogger, nil, nil, nil, nil)
+}
+
+// edns0Effective reports whether the server will actually size its answers against
+// the EDNS0 budget this session announced. The server enlarges them only once the
+// session is authenticated - anonymous sessions stay at the legacy 512-byte budget
+// so an open deployment cannot be used as a big-pipe amplifier - so announcing
+// EDNS0 without Noise or a PSK costs bytes on every query for no throughput.
+func (t *DNSClientTunnel) edns0Effective() bool {
+	return t.edns0 && (t.noiseSession != nil || len(t.pskKey) > 0)
 }
 
 // sendQuery sends one tunnel query to a single upstream server and feeds any answer
@@ -821,7 +906,16 @@ func (t *DNSClientTunnel) sendQueryContext(ctx context.Context, pathIdx int, fla
 	}
 
 	msg := t.buildQuery(dataSeq, flag, wirePayload)
+	// Every exchange is bounded independently, not only by the caller's overall
+	// deadline: a poll that is dropped is retried right away, so its wait must not
+	// be allowed to consume the whole session budget.
+	ctx, cancel := context.WithTimeout(ctx, t.adaptiveExchangeTimeout())
+	defer cancel()
+	exchangeStart := time.Now()
 	resp, err := t.paths[pathIdx].exchange(ctx, msg)
+	if err == nil {
+		t.observeRTT(time.Since(exchangeStart))
+	}
 	if t.debug {
 		answers := 0
 		if resp != nil {
@@ -893,6 +987,67 @@ func (t *DNSClientTunnel) upstreamWindow() int {
 	return w
 }
 
+// adaptiveExchangeTimeout is how long this session waits for one DNS exchange's
+// reply. It is the configured ceiling until the session has measured the path's
+// round trip, and from then on it is clamped to that measurement.
+//
+// The wait matters more than the query rate: a dropped query burns the whole
+// wait before the same chunk is retransmitted, so on a 200 ms link waiting the
+// full ceiling stalls the transfer for 20x its RTT per loss. bestRTT is only ever
+// lowered by successful samples (see onWindowSample), so the clamp tracks the
+// path's healthy latency rather than its tail, and the floor keeps scheduler
+// jitter on a sub-millisecond link from turning delivered queries into spurious
+// retries.
+//
+// The clamp engages immediately and never waits out the window warm-up: on a lossy
+// path that warm-up takes longer than the transfer, so deferring it would apply the
+// ceiling to every loss. A session that has not measured anything yet waits the floor
+// rather than the ceiling - it cannot afford to spend four seconds discovering its
+// first dropped chunk, and once samples arrive the factor can only lengthen the wait
+// if the path truly needs it.
+func (t *DNSClientTunnel) adaptiveExchangeTimeout() time.Duration {
+	limit := t.exchangeTimeout
+	best := t.bestRTT.Load()
+	if best <= 0 {
+		if dnsTunnelExchangeMinTimeout < limit {
+			return dnsTunnelExchangeMinTimeout
+		}
+		return limit
+	}
+	adapted := time.Duration(best) * dnsTunnelExchangeRTTFactor
+	if adapted < dnsTunnelExchangeMinTimeout {
+		adapted = dnsTunnelExchangeMinTimeout
+	}
+	if adapted < limit {
+		return adapted
+	}
+	return limit
+}
+
+// observeRTT records one successful round trip against bestRTT, which is kept as a
+// running minimum. Every successful exchange feeds it, the handshake and target
+// declaration included, so that the wait is already clamped when the session's first
+// data query runs. Zero and negative readings are clock artifacts - a reply that was
+// already sitting in the socket buffer can be observed in under one monotonic tick -
+// and are dropped rather than recorded, because pinning bestRTT there would hold the
+// exchange wait at the floor forever and turn every queued query into a retry. A
+// handshake that also paid for socket setup can only overestimate the path's latency,
+// and later samples pull it back down.
+func (t *DNSClientTunnel) observeRTT(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	for {
+		best := t.bestRTT.Load()
+		if best > 0 && int64(rtt) >= best {
+			return
+		}
+		if t.bestRTT.CompareAndSwap(best, int64(rtt)) {
+			return
+		}
+	}
+}
+
 // onWindowSample adapts the in-flight window from a completed upstream query, the same
 // way congestion control does: grow while the path still answers at its best RTT, back
 // off as soon as it slows down or drops. The right window is a property of the path,
@@ -904,12 +1059,15 @@ func (t *DNSClientTunnel) onWindowSample(ok bool, rtt time.Duration) {
 		t.halveWindow()
 		return
 	}
-	// A zero round trip is a shutdown or clock artifact, not a measurement. Taking it
-	// as the best RTT ever seen would make every later sample look slow and pin the
-	// window at its minimum.
+	// A zero round trip is a shutdown or clock artifact, not a measurement.
 	if rtt <= 0 {
 		return
 	}
+	// adaptiveExchangeTimeout needs a measurement immediately and must not wait out
+	// the warm-up below: on a lossy path that warm-up takes longer than the transfer,
+	// so the ceiling would apply to every loss. The window logic ignores bestRTT until
+	// after warm-up, so reading it earlier does not change its behaviour.
+	t.observeRTT(rtt)
 	// The first queries include socket setup, DNS server warm-up and GC noise, so
 	// their latency says nothing about the path. Adopting one of those as the
 	// "best" RTT would make every later sample look fast and pin the window at the
@@ -952,9 +1110,6 @@ func (t *DNSClientTunnel) onWindowSample(ok bool, rtt time.Duration) {
 		return
 	}
 
-	if best == 0 || int64(rtt) < best {
-		t.bestRTT.Store(int64(rtt))
-	}
 	t.growWindow()
 }
 
@@ -1485,11 +1640,30 @@ func (t *DNSClientTunnel) sendDataChunkWithRetry(chunk []byte, dataSeq uint32, a
 		// link blip. There is intentionally no attempt cap: net.Conn writes are
 		// allowed to block until their deadline, and abandoning this sequence
 		// would make every later byte permanently unusable.
-		shift := min(attempt, 4)
-		if err := t.waitBeforeRetry(min(dnsTunnelMaxRetryBackoff, 200*time.Millisecond<<shift), abort); err != nil {
-			return err
+		if d := retryDelay(attempt); d > 0 {
+			if err := t.waitBeforeRetry(d, abort); err != nil {
+				return err
+			}
 		}
 	}
+}
+
+// retryDelay is the pause before retransmitting one chunk. The first retry carries
+// no pause at all: the exchange has already waited a full adaptiveExchangeTimeout
+// before failing, and adding 200 ms on top only delays a retransmit the server is
+// going to dedup anyway. From the second retry the pause doubles and saturates at
+// dnsTunnelMaxRetryBackoff, so a persistently dead path still settles on a steady
+// retry rate instead of spinning.
+func retryDelay(attempt int) time.Duration {
+	if attempt == 0 {
+		return 0
+	}
+	shift := min(attempt, 4)
+	d := 200 * time.Millisecond << shift
+	if d > dnsTunnelMaxRetryBackoff {
+		return dnsTunnelMaxRetryBackoff
+	}
+	return d
 }
 
 func (t *DNSClientTunnel) waitBeforeRetry(d time.Duration, abort <-chan struct{}) error {
@@ -1610,7 +1784,7 @@ func (t *DNSClientTunnel) sendCloseSignal() {
 
 	// Send on the detached context through a throwaway path so it still goes out
 	// after the tunnel's own context is cancelled.
-	path := newDNSPath(t.servers[t.nextServer()], t.dialer, t.tlsConfig)
+	path := newDNSPath(t.servers[t.nextServer()], t.dialer, t.tlsConfig, t.exchangeTimeout)
 	defer path.close()
 	_, _ = path.exchange(ctx, m)
 }
@@ -1659,7 +1833,14 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 			return "", net.ErrClosed
 		}
 		idx := t.nextServer()
+		exchangeStart := time.Now()
 		resp, err := t.paths[idx].exchange(t.ctx, t.buildQuery(dnsTunnelControlSeq, flagTarget, payload))
+		if err == nil {
+			// This probe is the first successful exchange of an unauthenticated
+			// session, and adaptiveExchangeTimeout needs it: without a measurement
+			// the first data query would still wait out the configured ceiling.
+			t.observeRTT(time.Since(exchangeStart))
+		}
 		if err == nil && resp != nil {
 			for _, ans := range resp.Answer {
 				if raw := extractAnswer(ans); raw != nil {

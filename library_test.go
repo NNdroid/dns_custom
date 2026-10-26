@@ -126,13 +126,13 @@ func TestNewClientValidation(t *testing.T) {
 
 func TestClientDialerPropagation(t *testing.T) {
 	dialer := &net.Dialer{Timeout: 123 * time.Millisecond}
-	path := newDNSPath("udp://127.0.0.1:53", dialer, nil)
+	path := newDNSPath("udp://127.0.0.1:53", dialer, nil, dnsTunnelExchangeTimeout)
 	defer path.close()
 	if path.dnsCli == nil || path.dnsCli.Dialer != dialer {
 		t.Fatal("custom dialer was not propagated to the DNS client")
 	}
 
-	doh := newDNSPath("https://resolver.example/dns-query", dialer, nil)
+	doh := newDNSPath("https://resolver.example/dns-query", dialer, nil, dnsTunnelExchangeTimeout)
 	defer doh.close()
 	transport, ok := doh.httpCli.Transport.(*http.Transport)
 	if !ok || transport.DialContext == nil {

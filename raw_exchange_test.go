@@ -26,7 +26,7 @@ func TestRawExchangeRate(t *testing.T) {
 			} else {
 				addr = startTestDNSTCPServer(t, handler)
 			}
-			path := newDNSPath(network+"://"+addr, nil, nil)
+			path := newDNSPath(network+"://"+addr, nil, nil, dnsTunnelExchangeTimeout)
 			defer path.close()
 			if network == "udp" {
 				path.addr = addr // udp:// prefix is not a path scheme; use the bare addr

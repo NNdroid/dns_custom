@@ -16,8 +16,25 @@ import (
 
 const (
 	dnsTunnelDefaultChunk = 32
-	dnsTunnelQueryTimeout = 5 * time.Second
-	dnsTunnelPollInterval = 150 * time.Millisecond
+	// dnsTunnelExchangeTimeout caps how long one DNS exchange may wait for its
+	// reply. A lost query burns this much wall clock before the tunnel retransmits
+	// the same chunk, so under loss it costs far more than the query rate does: on
+	// a link that loses 1 in 20 queries most of the transfer time is spent waiting
+	// out these timeouts. It is the ceiling for adaptiveExchangeTimeout, which
+	// clamps the wait down once the session has measured a round trip.
+	dnsTunnelExchangeTimeout = 4 * time.Second
+	// dnsTunnelExchangeRTTFactor and dnsTunnelExchangeMinTimeout clamp the
+	// exchange wait to the path's own round trip. Waiting the full ceiling on a
+	// 200 ms path spends 20x its RTT discovering one dropped query; the factor
+	// leaves ample room for jitter and reordering. The floor keeps scheduler
+	// jitter on a sub-millisecond link from turning delivered queries into
+	// spurious retries, which would only multiply the traffic a lossy path needs.
+	dnsTunnelExchangeRTTFactor  = 8
+	dnsTunnelExchangeMinTimeout = 500 * time.Millisecond
+	// dnsTunnelPollInterval paces a poller with nothing to fetch. Downstream bytes
+	// arrive only as answers to the client's own polls, so on a clean path this
+	// interval - not bandwidth, not chunk size - sets the transfer rate.
+	dnsTunnelPollInterval = 50 * time.Millisecond
 	// dnsTunnelMaxServerChunk is the nominal downstream chunk size under the
 	// legacy 512-byte UDP budget. With EDNS0 negotiated the budget grows to
 	// dnsTunnelEDNS0UDPSize, and the TXT/NULL ceiling rises with it — the fit
