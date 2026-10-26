@@ -310,7 +310,63 @@ go test ./...        # full test suite
 go test -race ./...  # with race detector (needs CGO and a C toolchain)
 ```
 
-CI (`.github/workflows/test.yml`) runs vet plus plain and race-enabled tests
-on Linux, macOS and Windows for every push and pull request. Pushing a
-`v1.0.yyyyMMdd.<commit-count>-<short-sha>` tag triggers `.github/workflows/release.yml`,
-which re-runs the tests and publishes raw binaries for 9 platforms.
+### Benchmarks
+
+```bash
+go test -run '^$' -bench . -benchtime 1x ./...        # everything, once
+go test -run '^$' -bench BenchmarkTunnelThroughput -benchtime 5s .
+./scripts/benchmark-weaknet.sh                         # degraded-path sweep
+```
+
+`weaknet_test.go` puts a real UDP relay between the client and a live DNS
+server and degrades the path in both directions: per-packet delay, jitter,
+loss, duplication, reordering and a token-bucket bandwidth cap. It is a relay
+rather than a `net.Conn` wrapper, so the client's own dial pooling,
+retransmission, deduplication and reorder assembly are what get measured.
+Each profile reports goodput, `retries` (retransmitted upstream chunks per
+iteration) and `window` (the adaptive in-flight window it settled at).
+
+| profile      | degradation                                    |
+|--------------|------------------------------------------------|
+| `clean`      | baseline, loopback                             |
+| `3g`         | 75 ms one-way, 2 % loss                        |
+| `4g`         | 40 ms one-way, 1 % loss                        |
+| `badWifi`    | 15 ms one-way + 40 ms jitter, 5 % loss         |
+| `congested`  | 250 ms one-way, 10 % loss                      |
+| `lossy`      | 10 % loss, no added latency                    |
+| `reordered`  | 25 % of packets delivered twice, delayed       |
+| `duplicated` | 30 % of packets delivered twice                |
+| `2mbit`      | 2 Mbit/s cap                                   |
+| `512kbit`    | 512 kbit/s cap                                 |
+
+Loss and duplication are applied per leg, so a 10 % link still lets 91.8 % of
+a round trip through. Payload size is tuned per profile rather than shared: the
+client retransmits a lost chunk only after its DNS query times out, and that
+timeout is a fixed 4 s regardless of the path's latency, so a high-loss profile
+carries fewer chunks. The relay's own knobs are pinned by
+`TestWeakLinkAppliesEveryDegradationMode`, `TestWeakLinkInjectsDelayAndReorder`
+and `TestWeakLinkRateLimits`, which check each degradation against the wire
+instead of trusting the injection code by convention.
+
+### CI
+
+`.github/workflows/test.yml` is the merge gate: vet plus plain and
+race-enabled tests, and a one-iteration smoke of every benchmark, on Linux,
+macOS and Windows for every push and pull request. A second job repeats vet,
+tests and the benchmark smoke compiled for `GOARCH=386`, which is where
+unaligned 64-bit atomics and integer truncation surface.
+
+`.github/workflows/throughput.yml` compares a pull request's benchmark numbers
+against its base using `benchstat`, across the UDP/TCP/DoH upstream by TCP/UDP
+target matrix.
+
+`.github/workflows/weaknet.yml` runs the degraded-path sweep on Linux, macOS
+and Windows every Monday and on demand (`workflow_dispatch`, with a
+`benchtime` input). It uploads the raw `go test` output and a CSV per runner as
+artifacts and writes a markdown table to the run summary, so week-over-week
+changes in the loss profiles are readable without digging through logs.
+
+Pushing a `v1.0.yyyyMMdd.<commit-count>-<short-sha>` tag triggers
+`.github/workflows/release.yml`, which re-runs the tests and publishes raw
+binaries for 9 platforms. The workflow can also be run manually, in which case
+it builds and uploads the binaries as an artifact instead of creating a release.

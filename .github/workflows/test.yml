@@ -42,6 +42,15 @@ jobs:
       # Smoke-run every benchmark once (no meaningful numbers on shared
       # runners): the point is to catch panics, deadlocks and bit-rot in the
       # benchmarks themselves, which plain `go test` never executes.
+      #
+      # This pattern includes BenchmarkWeakLink, the degraded-path sweep in
+      # weaknet_test.go: a UDP relay that injects loss, jitter, duplication,
+      # reordering and a bandwidth cap between the client and a real DNS
+      # server, so the client's own retransmit, dedup and reorder logic is what
+      # is measured. One iteration per profile takes about a minute; the
+      # lossy/congested profiles are the slow ones, because a lost upstream
+      # chunk is retransmitted only after the DNS query's 4 s timeout. Real
+      # numbers live in the scheduled weaknet.yml job, not here.
       - name: Benchmark smoke
         run: go test -run '^$' -bench . -benchtime 1x -timeout 15m ./...
 

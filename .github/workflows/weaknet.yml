@@ -1,0 +1,81 @@
+name: Weak-network benchmark
+
+# Scheduled sweep of the degraded-path benchmarks in weaknet_test.go. The merge
+# gate in test.yml runs these once per profile only to prove they execute; this
+# job runs them long enough to be meaningful and keeps the history as artifacts,
+# so a regression in the tunnel's loss handling shows up as a trend in the CSV
+# rather than as a flaky build.
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      benchtime:
+        description: Benchmark duration per profile, for example 3x or 5s
+        required: false
+        default: '3x'
+        type: string
+
+permissions:
+  contents: read
+
+# A manual re-run of the previous manual run is never useful; keep the two
+# throughput workflows' concurrency conventions identical.
+concurrency:
+  group: weaknet-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  weaknet:
+    name: Weak-link sweep (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run weak-link sweep
+        shell: bash
+        env:
+          BENCHTIME: ${{ github.event.inputs.benchtime || '3x' }}
+          OUT_DIR: bench
+        run: ./scripts/benchmark-weaknet.sh
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: weaknet-${{ matrix.os }}
+          path: bench/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # A markdown table per runner, so the numbers are readable on the run page
+      # without downloading the artifact. Written even on failure, which is when
+      # the absence of rows is the useful signal.
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          csv="bench/weaknet.csv"
+          {
+            echo "### Weak-link sweep (${{ matrix.os }})"
+            echo
+            if [ ! -f "$csv" ]; then
+              echo "No results: the sweep failed before producing a CSV."
+              exit 0
+            fi
+            echo '| profile | ns/op | MB/s | retries | window |'
+            echo '|---|--:|--:|--:|--:|'
+            tail -n +2 "$csv" | awk -F, '{printf "| %s | %s | %s | %s | %s |\n", $1, $3, $4, $5, $6}'
+          } >> "${GITHUB_STEP_SUMMARY}"
