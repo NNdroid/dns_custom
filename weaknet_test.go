@@ -68,11 +68,11 @@ func (p weakLinkProfile) decide(r *mrandv2.Rand) []time.Duration {
 // tokenBucket is a leaky bucket shared by every flow in one direction, so the
 // cap models the link's capacity rather than a per-connection quota.
 type tokenBucket struct {
-	mu      sync.Mutex
-	rate    float64 // bytes per second; 0 = uncapped
-	burst   float64 // bytes admitted before pacing kicks in; 0 = one second's worth
-	tokens  float64
-	last    time.Time
+	mu     sync.Mutex
+	rate   float64 // bytes per second; 0 = uncapped
+	burst  float64 // bytes admitted before pacing kicks in; 0 = one second's worth
+	tokens float64
+	last   time.Time
 }
 
 // capacity is the most credit the bucket ever holds, so a burst of datagrams can
@@ -118,7 +118,7 @@ func (b *tokenBucket) pace(n int, closed <-chan struct{}) {
 	// the right point instead of double-counting the wait.
 	shortfall := need - b.tokens
 	b.tokens = 0
-	wait = time.Duration(shortfall/b.rate*float64(time.Second))
+	wait = time.Duration(shortfall / b.rate * float64(time.Second))
 	b.last = now.Add(wait)
 	b.mu.Unlock()
 
@@ -792,7 +792,7 @@ func TestTokenBucketPaces(t *testing.T) {
 		b.pace(size, closed)
 	}
 	elapsed := time.Since(t0)
-	want := time.Duration(float64(size*packets-512)/64000*float64(time.Second))
+	want := time.Duration(float64(size*packets-512) / 64000 * float64(time.Second))
 	t.Logf("128 KiB through a 64 KiB/s bucket in %v, want about %v",
 		elapsed.Round(time.Millisecond), want.Round(time.Millisecond))
 	if elapsed < want-200*time.Millisecond {

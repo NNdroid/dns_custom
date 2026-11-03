@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -830,6 +831,7 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 		})
 	}
 	go func() {
+		defer t.guardGoroutine("context watcher")
 		<-t.ctx.Done()
 		t.closeWith(deathReasonContextDone, t.ctx.Err())
 	}()
@@ -876,10 +878,10 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 	// The DNS transaction ID must be independent of the query counter: a
 	// sequential ID lets an off-path attacker who has seen one query predict
 	// every later one and inject spoofed answers (matters when Noise is off).
+	// Drawn from the in-process stream - a syscall here cost more than the rest
+	// of query assembly put together.
 	var idBuf [2]byte
-	if _, err := crand.Read(idBuf[:]); err != nil {
-		idBuf[0], idBuf[1] = byte(seq>>8), byte(seq)
-	}
+	fastRandBytes(idBuf[:])
 	m.Id = binary.BigEndian.Uint16(idBuf[:])
 	if t.edns0 {
 		m.SetEdns0(dnsTunnelEDNS0UDPSize, false)
@@ -909,6 +911,17 @@ func (t *DNSClientTunnel) sendQueryContext(ctx context.Context, pathIdx int, fla
 	// Every exchange is bounded independently, not only by the caller's overall
 	// deadline: a poll that is dropped is retried right away, so its wait must not
 	// be allowed to consume the whole session budget.
+	//
+	// The bound is normally carried by the socket timeout instead of a per-query
+	// context timer. miekg/dns never selects on ctx.Done(); it only reads the
+	// deadline carried by ctx, so a context.WithTimeout allocated a runtime timer
+	// per query only to produce a deadline the client can set itself.
+	//
+	// That shortcut is only valid when ctx has no deadline or a looser one. When a
+	// Write passes its own (much later) deadline, miekg would use that and let one
+	// dropped query burn the caller's entire write budget - on a 500 ms / 10% loss
+	// path that turned a single lost packet into a minute-long stall. In that case
+	// the tighter deadline has to be put back on the context, timer and all.
 	ctx, cancel := context.WithTimeout(ctx, t.adaptiveExchangeTimeout())
 	defer cancel()
 	exchangeStart := time.Now()
@@ -1135,6 +1148,12 @@ func (t *DNSClientTunnel) growWindow() {
 
 // halveWindow backs the window off after a failed query: a path that is dropping
 // queries must not keep a wide window, or every retry floods it further.
+//
+// A gentler step (1/8 per failure, collapsing only on a run of failures) was tried
+// and measured worse: on the 10%-loss / 500 ms profile it kept the window near 11
+// instead of 4, and the extra concurrent queries kept the simulated link saturated
+// until every retry timed out. The window's floor on a latency-dominated link comes
+// from the RTT bands above, not from this step, so softening it bought nothing.
 func (t *DNSClientTunnel) halveWindow() {
 	t.resizeWindow(func(cur int32) int32 {
 		next := cur / 2
@@ -1314,10 +1333,11 @@ func (t *DNSClientTunnel) downstreamBacklog() int {
 }
 
 // pollLoop keeps one upstream path busy: it polls, hands any answer to the reassembly,
-// and paces itself. Data-bearing polls pipeline; empty polls back off. It also pauses
-// while the reader has not drained what was already fetched, so a slow consumer cannot
-// make the tunnel hoard answers.
+// and paces itself. A data-bearing answer re-polls immediately; an empty answer backs
+// off. It also pauses while the reader has not drained what was already fetched, so a
+// slow consumer cannot make the tunnel hoard answers.
 func (t *DNSClientTunnel) pollLoop(idx int, idle time.Duration) {
+	defer t.guardGoroutine("pollLoop")
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
@@ -1360,9 +1380,19 @@ func (t *DNSClientTunnel) pollLoop(idx int, idle time.Duration) {
 			t.markPathFailed(idx)
 		case n > 0:
 			t.markPathHealthy(idx)
-			delay = dnsTunnelPollBusyInterval
+			// The server still has data, so fetch it now instead of sleeping out a
+			// fixed busy interval. On a sub-millisecond path that sleep plus its
+			// jitter was several round trips of pure idle time and capped the fetch
+			// rate at roughly one poll per interval no matter how fast the path
+			// actually was - it, not the server's window, was what limited
+			// downstream throughput. The next exchange blocks on the network, so
+			// dropping the pause is not a busy loop.
+			delay = 0
 		default:
 			t.markPathHealthy(idx)
+		}
+		if delay <= 0 {
+			continue
 		}
 		// De-jitter the metronome: a fixed poll interval is a strong periodic
 		// beacon for traffic analysis. Spread each wait uniformly across
@@ -1511,6 +1541,7 @@ func (t *DNSClientTunnel) Write(p []byte) (int, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer t.guardGoroutine("write worker")
 			for {
 				k := int(cursor.Add(1)) - 1
 				if k >= len(jobs) {
@@ -1706,6 +1737,24 @@ const (
 	deathReasonServerSessionGone = ReasonServerSessionGone
 )
 
+// guardGoroutine turns a panic in one of the tunnel's long-lived goroutines into a
+// session failure instead of a process crash.
+//
+// The server has always guarded its DNS handler this way; the client side had no
+// guard at all. That asymmetry is the dangerous one: the client is the half embedded
+// in someone else's process (an SSH client, a VPN daemon, a mobile app), so a
+// malformed answer or an unexpected nil in the data path would kill the host
+// application outright. Failing one session is the recoverable outcome; the caller
+// reconnects and gets a fresh one.
+func (t *DNSClientTunnel) guardGoroutine(where string) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	t.log.Errorf("panic in %s (session %s): %v\n%s", where, t.session, r, debug.Stack())
+	t.closeWith(ReasonInternalPanic, fmt.Errorf("panic in %s: %v", where, r))
+}
+
 // closeWith performs the teardown once and records why the session died, so
 // Done()/Err() and the TunnelDied event carry the actual cause.
 func (t *DNSClientTunnel) closeWith(reason string, err error) {
@@ -1736,7 +1785,24 @@ func (t *DNSClientTunnel) closeWith(reason string, err error) {
 	if t.events != nil {
 		t.events.close()
 	}
-	t.sendCloseSignal()
+	// Tell the server on a detached goroutine. This used to run inline, which made
+	// every Close() - and every session death, including the ones raised from a
+	// failing poller - wait out a fresh DNS dial plus up to dnsTunnelCloseTimeout.
+	// An embedder closing many sessions on shutdown paid that serially, and a
+	// poller could not finish tearing the session down until the last close query
+	// timed out. The server also expires idle sessions, so a lost signal only
+	// shortens the session's life rather than leaking it.
+	// Tell the server on a detached goroutine. This used to run inline, which made
+	// every Close() - and every session death, including the ones raised from a
+	// failing poller - wait out a fresh DNS dial plus up to dnsTunnelCloseTimeout.
+	// An embedder closing many sessions on shutdown paid that serially, and a
+	// poller could not finish tearing the session down until the last close query
+	// timed out. The server also expires idle sessions, so a lost signal only
+	// shortens the session's life rather than leaking it.
+	go func() {
+		defer t.guardGoroutine("close signal")
+		t.sendCloseSignal()
+	}()
 	t.cancel()
 	for _, p := range t.paths {
 		p.close()

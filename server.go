@@ -203,7 +203,7 @@ type DNSServer struct {
 	privKey      [32]byte
 	hasPrivKey   bool
 	pskKeys      [][]byte               // derived PSKs for client authentication
-	limiters     map[string]*srcLimiter // per-source-IP query rate buckets
+	limiters     map[srcKey]*srcLimiter // per-source-IP query rate buckets
 	// limMu guards limiters only. It is deliberately separate from mu: rate
 	// limiting runs on every single query, and sharing the session lock would
 	// serialize all of them behind one exclusive lock.
@@ -272,14 +272,18 @@ type dnsSession struct {
 	noiseSession   *NoiseSession
 	clientBuf      *bytes.Buffer
 	serverBuf      *bytes.Buffer
-	mu             sync.Mutex
-	readCond       *sync.Cond
-	serverCond     *sync.Cond   // wakes a backend reader when downstream buffer space is freed
-	pumpWaiting    bool         // true while the backend pump is blocked in readCond.Wait
-	lastActive     atomic.Int64 // 64-bit atomic: typed to guarantee 8-byte alignment on 32-bit ARM
-	closed         bool
-	closeOnce      sync.Once
-	log            *zap.SugaredLogger
+	// frameBuf is reused by the single framed-datagram pump goroutine to hold one
+	// upstream datagram. Allocating up to 64 KiB per datagram was the largest
+	// per-packet allocation in datagram mode.
+	frameBuf    []byte
+	mu          sync.Mutex
+	readCond    *sync.Cond
+	serverCond  *sync.Cond   // wakes a backend reader when downstream buffer space is freed
+	pumpWaiting bool         // true while the backend pump is blocked in readCond.Wait
+	lastActive  atomic.Int64 // 64-bit atomic: typed to guarantee 8-byte alignment on 32-bit ARM
+	closed      bool
+	closeOnce   sync.Once
+	log         *zap.SugaredLogger
 
 	// Reliable-ordered transport: dedup plus in-order reassembly in both directions.
 	clientNext       uint32                      // next in-order upstream dataSeq expected from client
@@ -466,8 +470,16 @@ func (s *dnsSession) readFramedFromClient() ([]byte, bool) {
 		return nil, false
 	}
 	n := int(binary.BigEndian.Uint16(hdr[:]))
-	payload := make([]byte, n)
-	if n > 0 && !s.readNFromClientBuf(payload) {
+	if n == 0 {
+		return nil, true
+	}
+	// frameBuf is owned by this session's single pump goroutine, which writes the
+	// slice out before asking for the next frame, so it can be reused.
+	if cap(s.frameBuf) < n {
+		s.frameBuf = make([]byte, n)
+	}
+	payload := s.frameBuf[:n]
+	if !s.readNFromClientBuf(payload) {
 		return nil, false
 	}
 	return payload, true
@@ -925,6 +937,7 @@ func (s *dnsSession) startBackendOnce() bool {
 // both directions. It runs lazily on the first data chunk, after any target
 // declaration has been applied.
 func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
+	defer s.guardSessionGoroutine("backend forwarder", sess)
 	sess.mu.Lock()
 	network, addr, framed, wantsDatagram := sess.targetNetwork, sess.targetAddr, sess.framedUDP, sess.wantsDatagram
 	sess.mu.Unlock()
@@ -972,6 +985,7 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 	sess.log.Infof("[%s] 🔗 Connected to TCP target (%s)", sess.sessionID, addr)
 
 	go func() {
+		defer s.guardSessionGoroutine("backend pump", sess)
 		defer sess.close()
 		buf := make([]byte, 4096)
 		for {
@@ -996,6 +1010,7 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 	}()
 
 	go func() {
+		defer s.guardSessionGoroutine("backend pump", sess)
 		defer sess.close()
 		buf := make([]byte, 4096)
 		for {
@@ -1020,6 +1035,7 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 // clients). Datagram boundaries are not preserved in this mode.
 func (s *DNSServer) startUDPLegacyForwarder(sess *dnsSession, conn net.Conn) {
 	go func() {
+		defer s.guardSessionGoroutine("backend pump", sess)
 		defer sess.close()
 		buf := make([]byte, 4096)
 		for {
@@ -1051,6 +1067,7 @@ func (s *DNSServer) startUDPLegacyForwarder(sess *dnsSession, conn net.Conn) {
 // datagram the backend sends becomes one downstream frame.
 func (s *DNSServer) startUDPFramedForwarder(sess *dnsSession, conn net.Conn) {
 	go func() {
+		defer s.guardSessionGoroutine("backend pump", sess)
 		defer sess.close()
 		for {
 			dgram, ok := sess.readFramedFromClient()
@@ -1076,6 +1093,7 @@ func (s *DNSServer) startUDPFramedForwarder(sess *dnsSession, conn net.Conn) {
 // pre-UDP-dial behavior.
 func (s *DNSServer) pumpUDPToSession(sess *dnsSession, conn net.Conn, framed bool) {
 	go func() {
+		defer s.guardSessionGoroutine("backend pump", sess)
 		defer sess.close()
 		buf := make([]byte, udpFrameMaxDatagram)
 		for {
@@ -1377,7 +1395,26 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 	_ = w.WriteMsg(reply)
 }
 
+// guardSessionGoroutine turns a panic in a long-lived server goroutine into a
+// failed session rather than a dead process. ServeDNS has always guarded the
+// per-query path; the backend forwarders and the cleanup loop run outside it and
+// had no guard at all, so a panic while dialing or pumping took the whole server
+// down - the same class of bug the query guard exists to prevent.
+func (s *DNSServer) guardSessionGoroutine(where string, sess *dnsSession) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if sess != nil {
+		sess.log.Errorf("panic in %s (session %s): %v\n%s", where, sess.sessionID, r, debug.Stack())
+		sess.close()
+		return
+	}
+	s.log.Errorf("panic in %s: %v\n%s", where, r, debug.Stack())
+}
+
 func (s *DNSServer) cleanupLoop(ctx context.Context) {
+	defer s.guardSessionGoroutine("cleanup loop", nil)
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -1466,20 +1503,20 @@ func (s *DNSServer) allowQuery(remote net.Addr) bool {
 	if rate <= 0 || remote == nil {
 		return true
 	}
-	host := remoteAddrHost(remote)
+	key := remoteAddrKey(remote)
 	now := time.Now()
 	s.limMu.Lock()
 	defer s.limMu.Unlock()
 	if s.limiters == nil {
-		s.limiters = make(map[string]*srcLimiter)
+		s.limiters = make(map[srcKey]*srcLimiter)
 	}
-	lim, ok := s.limiters[host]
+	lim, ok := s.limiters[key]
 	if !ok {
 		if len(s.limiters) >= dnsTunnelMaxTrackedSources {
 			// Table full (typically a spoofed-source flood): evict the least
 			// recently used entry instead of refusing every new source until
 			// the next cleanup pass, so legitimate clients keep working.
-			oldestKey := ""
+			var oldestKey srcKey
 			var oldest time.Time
 			first := true
 			for k, v := range s.limiters {
@@ -1489,7 +1526,7 @@ func (s *DNSServer) allowQuery(remote net.Addr) bool {
 			}
 			delete(s.limiters, oldestKey)
 		}
-		s.limiters[host] = &srcLimiter{tokens: float64(rate), last: now}
+		s.limiters[key] = &srcLimiter{tokens: float64(rate), last: now}
 		return true
 	}
 	elapsed := now.Sub(lim.last).Seconds()
@@ -1505,15 +1542,38 @@ func (s *DNSServer) allowQuery(remote net.Addr) bool {
 	return true
 }
 
-func remoteAddrHost(remote net.Addr) string {
+// srcKey identifies a query source without allocating. It used to be the result of
+// net.IP.String(), which allocates a fresh string on every single query and then
+// hashes it as a map key - pure garbage on the hottest path the server has. The
+// leading tag keeps an IPv4 address from colliding with an IPv6 address whose
+// bytes happen to match.
+type srcKey [17]byte
+
+func remoteAddrKey(remote net.Addr) (key srcKey) {
+	var ip net.IP
 	switch a := remote.(type) {
 	case *net.UDPAddr:
-		return a.IP.String()
+		ip = a.IP
 	case *net.TCPAddr:
-		return a.IP.String()
-	default:
-		return remote.String()
+		ip = a.IP
+	case *net.IPAddr:
+		ip = a.IP
 	}
+	if v4 := ip.To4(); v4 != nil {
+		key[0] = 4
+		copy(key[1:5], v4)
+		return key
+	}
+	if v16 := ip.To16(); v16 != nil {
+		key[0] = 6
+		copy(key[1:], v16)
+		return key
+	}
+	// Unknown address family: keep the textual form, hashed into the fixed key so
+	// the map key type stays allocation-free.
+	sum := sha256.Sum256([]byte(remote.String()))
+	copy(key[1:], sum[:16])
+	return key
 }
 
 func mapTargetNetwork(wantUDP bool) string {

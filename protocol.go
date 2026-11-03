@@ -94,10 +94,6 @@ const (
 	// adoption is suppressed — or a fresh session would crawl through its first
 	// burst.
 	dnsTunnelWindowWarmup = 16
-	// dnsTunnelPollBusyInterval paces a poller that just received data. On a real
-	// network the round trip dominates anyway; this only stops a zero-RTT peer from
-	// turning into a busy loop.
-	dnsTunnelPollBusyInterval = time.Millisecond
 	// dnsTunnelDownstreamBacklog is how much undelivered data the pollers buffer
 	// before they stop asking for more, so a slow reader cannot make the tunnel hoard
 	// answers in memory.
@@ -115,7 +111,14 @@ const (
 	// abandoned and a gap is accepted. Without this, one response that a resolver
 	// keeps dropping would stall the whole stream forever (the server retransmits
 	// the oldest chunk and never serves anything else).
-	dnsTunnelDownstreamGiveUp = 30 * time.Second
+	//
+	// 30s turned a single lost response into a freeze longer than most applications
+	// tolerate: SSH hangs, HTTP requests time out, and the peer often tears the
+	// connection down before the tunnel recovers. 8s still leaves ~16 round trips on
+	// a 500ms path for a retransmission to land, while cutting the worst case by
+	// almost 4x. Accepting a gap costs the current session's byte stream (the
+	// application reconnects), which beats a 30s freeze.
+	dnsTunnelDownstreamGiveUp = 8 * time.Second
 	// Target declarations get a wider, independent retry window than data chunks:
 	// with Noise on, the declaration waits for the handshake query to land first,
 	// and through recursive resolvers that can take several seconds. Losing the

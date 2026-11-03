@@ -51,6 +51,9 @@ const (
 	ReasonWriteTimeout      = "write deadline exceeded"
 	ReasonCtxCancelled      = "context cancelled"
 	ReasonServerSessionGone = "server session no longer exists"
+	// ReasonInternalPanic is a panic recovered inside one of the tunnel's own
+	// goroutines. The session is failed rather than the process being killed.
+	ReasonInternalPanic = "internal panic"
 	// ReasonMaxRetries is retained for source compatibility. Current clients
 	// retry transient transport failures until a deadline or cancellation.
 	ReasonMaxRetries = "write failed after max retries"

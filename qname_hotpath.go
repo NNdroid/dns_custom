@@ -1,7 +1,6 @@
 package dnstunnel
 
 import (
-	"crypto/rand"
 	"sync"
 )
 
@@ -16,6 +15,10 @@ var queryEncodingBufferPool = sync.Pool{New: func() any {
 // randomizeQNameCaseBytes applies DNS 0x20 encoding in-place. The hot
 // path calls this before the final []byte -> string conversion, avoiding
 // the old string -> []byte -> string round trip on every query.
+//
+// The coin flips come from the in-process stream (fastRandBytes) rather than
+// crypto/rand: this runs once per query, and a syscall per query was pure
+// overhead on top of an already per-query-syscall-heavy path.
 func randomizeQNameCaseBytes(b []byte) {
 	if len(b) == 0 {
 		return
@@ -25,9 +28,7 @@ func randomizeQNameCaseBytes(b []byte) {
 	if n > len(coins) {
 		n = len(coins)
 	}
-	if _, err := rand.Read(coins[:n]); err != nil {
-		return
-	}
+	fastRandBytes(coins[:n])
 	bit := 0
 	for i := range b {
 		if b[i] < 'a' || b[i] > 'z' {
