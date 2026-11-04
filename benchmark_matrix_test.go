@@ -195,7 +195,7 @@ func deadlineForBench() time.Time {
 
 // cliDialForBench opens one stream session against the given upstream servers.
 func cliDialForBench(ctx context.Context, servers []string, domain string) (net.Conn, error) {
-	t, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", "", "", "", false, nopLogger, nil, nil, nil, nil)
+	t, err := newTestTunnelSession(ctx, servers, domain, "", false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +204,7 @@ func cliDialForBench(ctx context.Context, servers []string, domain string) (net.
 
 // cliDialUDPForBench opens one datagram session against the given upstreams.
 func cliDialUDPForBench(ctx context.Context, servers []string, domain string) (net.PacketConn, error) {
-	t, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", udpSessionPrefix, "", "", false, nopLogger, nil, nil, nil, nil)
+	t, err := newTestTunnelSession(ctx, servers, domain, udpSessionPrefix, false, nil)
 	if err != nil {
 		return nil, err
 	}

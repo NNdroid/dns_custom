@@ -258,7 +258,7 @@ func newTuningTunnel(t *testing.T, opts ...tunnelOption) (*DNSClientTunnel, *ato
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	tun, err := newDNSClientTunnel(ctx, []string{addr}, "tune.local", "txt", "", "", "", "", false, nopLogger, nil, nil, nil, nil, opts...)
+	tun, err := newTestTunnelSession(ctx, []string{addr}, "tune.local", "", false, nil, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}

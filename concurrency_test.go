@@ -375,7 +375,7 @@ func benchmarkTunnelBench(b *testing.B, paths int, edns bool) {
 	b.SetBytes(size)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		tunnel, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", "", "", "", edns, nopLogger, nil, nil, nil, nil)
+		tunnel, err := newTestTunnelSession(ctx, servers, domain, "", edns, nil)
 		if err != nil {
 			b.Fatalf("NewDNSClientTunnel failed: %v", err)
 		}
@@ -445,7 +445,7 @@ func benchmarkTunnelThroughputTCP(b *testing.B, paths int) {
 	b.SetBytes(size)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		tunnel, err := newDNSClientTunnel(ctx, servers, domain, "txt", "", "", "", "", false, nopLogger, nil, nil, nil, nil)
+		tunnel, err := newTestTunnelSession(ctx, servers, domain, "", false, nil)
 		if err != nil {
 			b.Fatalf("NewDNSClientTunnel failed: %v", err)
 		}

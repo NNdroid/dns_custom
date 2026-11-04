@@ -10,7 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -53,6 +53,13 @@ const dnsTunnelTCPConnMaxQueries = 100
 // never be a valid DNS message. Capping it prevents a bad endpoint from forcing
 // an unbounded allocation in io.ReadAll.
 const maxDNSWireMessageSize = 65535
+
+// dnsTunnelCaseFailLimit is how many consecutive QNAME-case mismatches disable
+// the 0x20 validation for a session: a resolver path that normalizes case would
+// otherwise have every answer dropped forever, while an off-path spoofer cannot
+// influence the case of legitimate answers, so the fallback cannot be forced
+// open remotely.
+const dnsTunnelCaseFailLimit = 3
 
 // udpSessionPrefix marks a tunnel session as carrying length-framed UDP datagrams
 // instead of a raw byte stream. It lives inside the session label of the query
@@ -470,9 +477,26 @@ func validateDeclaredTarget(target string) error {
 	return nil
 }
 
-// options passes the client-level timing knobs to every session it opens.
-func (c *Client) options() []tunnelOption {
-	return []tunnelOption{withExchangeTimeout(c.exchangeTimeout), withPollInterval(c.pollInterval)}
+// sessionParams assembles the client-level construction parameters shared by
+// every dial entry point: the timing knobs ride the params' tuning struct
+// directly, so no separate option list is needed.
+func (c *Client) sessionParams(sessionPrefix, declaredTarget string, events *eventDispatcher[ClientEvent]) clientTunnelParams {
+	return clientTunnelParams{
+		servers:        c.servers,
+		domain:         c.domain,
+		recordType:     c.recordType,
+		pubKey:         c.publicKey,
+		sessionPrefix:  sessionPrefix,
+		declaredTarget: declaredTarget,
+		marker:         c.marker,
+		edns0:          c.edns0,
+		log:            c.log,
+		dialer:         c.dialer,
+		tlsConfig:      c.tlsConfig,
+		events:         events,
+		pskKey:         c.pskKey,
+		tuning:         tunnelTuning{exchangeTimeout: c.exchangeTimeout, pollInterval: c.pollInterval},
+	}
 }
 
 // dialStream opens one stream session declaring the given backend. When the
@@ -482,7 +506,7 @@ func (c *Client) dialStream(ctx context.Context, target string) (net.Conn, error
 	if strings.HasPrefix(target, "udp://") {
 		return nil, fmt.Errorf("dnstunnel: declared target %q is udp; use DialUDPTarget", target)
 	}
-	return newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey, c.options()...)
+	return newDNSClientTunnel(ctx, c.sessionParams("", target, c.eventsFor()))
 }
 
 // dialDatagram opens one datagram session declaring the given backend.
@@ -490,7 +514,7 @@ func (c *Client) dialDatagram(ctx context.Context, target string) (net.PacketCon
 	if target != "" && !strings.HasPrefix(target, "udp://") {
 		return nil, fmt.Errorf("dnstunnel: declared target %q is tcp; use DialTarget", target)
 	}
-	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, udpSessionPrefix, target, c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, c.eventsFor(), c.pskKey, c.options()...)
+	t, err := newDNSClientTunnel(ctx, c.sessionParams(udpSessionPrefix, target, c.eventsFor()))
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +584,7 @@ func (c *Client) DialUDPTarget(ctx context.Context, target string) (net.PacketCo
 // which local socket to bind. A server that predates target declarations (or
 // refuses the empty declaration) yields an error.
 func (c *Client) DefaultTarget(ctx context.Context) (string, error) {
-	t, err := newDNSClientTunnel(ctx, c.servers, c.domain, c.recordType, c.publicKey, "", "", c.marker, c.edns0, c.log, c.dialer, c.tlsConfig, nil, c.pskKey, c.options()...)
+	t, err := newDNSClientTunnel(ctx, c.sessionParams("", "", nil))
 	if err != nil {
 		return "", err
 	}
@@ -623,6 +647,10 @@ type DNSClientTunnel struct {
 	ack      uint32            // atomic; highest contiguous downstream serverSeq received (== recvNext-1)
 	recvNext uint32            // next expected downstream serverSeq
 	recvOOO  map[uint32][]byte // out-of-order downstream chunks buffered for in-order delivery
+	// seenHi is the highest downstream serverSeq ever decoded for this session,
+	// under recvMu. It bounds how far a skipTo may legitimately ask the client
+	// to jump (see deliverDownstream).
+	seenHi uint32
 	// recvOOOBytes tracks the total bytes held in recvOOO. Written under recvMu
 	// but read atomically from the pollers, so backlog backpressure can account
 	// for hoarded out-of-order data without ever taking two locks at once.
@@ -641,6 +669,19 @@ type DNSClientTunnel struct {
 	declaredTarget string
 	pskKey         []byte
 	marker         string
+
+	// Warn throttlers for conditions a hostile resolver can trigger once per
+	// answer; without them a flood of malformed or tampered responses becomes
+	// a log-flood disk DoS on the embedder's process.
+	warnDecrypt warnThrottle
+	warnOOO     warnThrottle
+
+	// 0x20 case validation state (see answerCaseOK). A path that normalizes
+	// QNAME case disables the check for the session after a short streak of
+	// mismatches; an off-path spoofer cannot influence the case of legitimate
+	// answers, so the fallback cannot be forced open remotely.
+	caseCheckDisabled atomic.Bool
+	caseFailStreak    atomic.Int32
 
 	// pollKick nudges idle pollers as soon as an upstream write completes, so the
 	// server's fresh downstream data is fetched within one RTT instead of after
@@ -680,78 +721,99 @@ func withPollInterval(d time.Duration) tunnelOption {
 	}
 }
 
-func newDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string, sessionPrefix string, declaredTarget string, marker string, edns0 bool, log *zap.SugaredLogger, dialer *net.Dialer, tlsConfig *tls.Config, events *eventDispatcher[ClientEvent], pskKey []byte, opts ...tunnelOption) (*DNSClientTunnel, error) {
-	if domain == "" || len(servers) == 0 {
-		return nil, fmt.Errorf("domain and servers are required")
+// clientTunnelParams carries everything one new tunnel session needs. It
+// replaces what used to be a fourteen-argument constructor: adding a knob no
+// longer touches every call site, and the empty-string / nil positional slots
+// are gone.
+type clientTunnelParams struct {
+	servers        []string
+	domain         string
+	recordType     string
+	pubKey         string
+	sessionPrefix  string
+	declaredTarget string
+	marker         string
+	edns0          bool
+	log            *zap.SugaredLogger
+	dialer         *net.Dialer
+	tlsConfig      *tls.Config
+	events         *eventDispatcher[ClientEvent]
+	pskKey         []byte
+	tuning         tunnelTuning
+}
+
+func newDNSClientTunnel(ctx context.Context, p clientTunnelParams) (*DNSClientTunnel, error) {
+	if p.domain == "" || len(p.servers) == 0 {
+		return nil, fmt.Errorf("dnstunnel: domain and servers are required")
 	}
-	if marker == "" {
-		marker = dnsTunnelMarker
+	if p.marker == "" {
+		p.marker = dnsTunnelMarker
 	}
-	qtype, err := dnsTypeToQType(recordType)
+	qtype, err := dnsTypeToQType(p.recordType)
 	if err != nil {
 		return nil, err
 	}
-	tuning := tunnelTuning{exchangeTimeout: dnsTunnelExchangeTimeout, pollInterval: dnsTunnelPollInterval}
-	for _, o := range opts {
-		o(&tuning)
+	tuning := p.tuning
+	if tuning.exchangeTimeout == 0 {
+		tuning.exchangeTimeout = dnsTunnelExchangeTimeout
 	}
-	paths := make([]*dnsPath, 0, len(servers))
-	for _, srv := range servers {
-		paths = append(paths, newDNSPath(srv, dialer, tlsConfig, tuning.exchangeTimeout))
+	if tuning.pollInterval == 0 {
+		tuning.pollInterval = dnsTunnelPollInterval
+	}
+	paths := make([]*dnsPath, 0, len(p.servers))
+	for _, srv := range p.servers {
+		paths = append(paths, newDNSPath(srv, p.dialer, p.tlsConfig, tuning.exchangeTimeout))
 	}
 	cctx, cancel := context.WithCancel(ctx)
+	// fail tears down everything the constructor may have allocated; every
+	// early-return below used to repeat this cleanup inline.
+	fail := func(err error) (*DNSClientTunnel, error) {
+		cancel()
+		for _, path := range paths {
+			path.close()
+		}
+		return nil, err
+	}
 	t := &DNSClientTunnel{
 		ctx:             cctx,
 		cancel:          cancel,
-		servers:         servers,
-		domain:          dns.Fqdn(domain),
+		servers:         p.servers,
+		domain:          dns.Fqdn(p.domain),
 		qtype:           qtype,
-		edns0:           edns0,
-		session:         sessionPrefix + randomSessionID(),
-		declaredTarget:  declaredTarget,
-		pskKey:          pskKey,
-		marker:          marker,
+		edns0:           p.edns0,
+		session:         p.sessionPrefix + randomSessionID(),
+		declaredTarget:  p.declaredTarget,
+		pskKey:          p.pskKey,
+		marker:          p.marker,
 		chunkSize:       dnsTunnelDefaultChunk,
 		exchangeTimeout: tuning.exchangeTimeout,
 		pollInterval:    tuning.pollInterval,
-		log:             log,
-		dialer:          dialer,
-		tlsConfig:       tlsConfig,
-		events:          events,
+		log:             p.log,
+		dialer:          p.dialer,
+		tlsConfig:       p.tlsConfig,
+		events:          p.events,
 		doneCh:          make(chan struct{}),
 		inBuf:           new(bytes.Buffer),
 		pollKick:        make(chan struct{}, len(paths)),
 		closeCh:         make(chan struct{}),
 		recvNext:        1,
 		recvOOO:         make(map[uint32][]byte),
-		failUntil:       make([]atomic.Int64, len(servers)),
+		failUntil:       make([]atomic.Int64, len(p.servers)),
 		paths:           paths,
 		window:          dnsTunnelUpstreamWindow,
 	}
 
-	if pubKeyStr != "" {
+	if p.pubKey != "" {
 		if qtype == dns.TypeA || qtype == dns.TypeAAAA {
-			cancel()
-			for _, p := range paths {
-				p.close()
-			}
-			return nil, fmt.Errorf("record type %q cannot carry authenticated Noise frames (A/AAAA hold 4/16 bytes); use txt/null/cname/mx/srv/ns", recordType)
+			return fail(fmt.Errorf("dnstunnel: record type %q cannot carry authenticated Noise frames (A/AAAA hold 4/16 bytes); use txt/null/cname/mx/srv/ns", p.recordType))
 		}
-		pk, err := ParseNoiseKey(pubKeyStr)
+		pk, err := ParseNoiseKey(p.pubKey)
 		if err != nil {
-			cancel()
-			for _, p := range paths {
-				p.close()
-			}
-			return nil, fmt.Errorf("invalid server public key: %w", err)
+			return fail(fmt.Errorf("dnstunnel: invalid server public key: %w", err))
 		}
 		ns, ePub, err := NewClientNoiseSession(pk)
 		if err != nil {
-			cancel()
-			for _, p := range paths {
-				p.close()
-			}
-			return nil, fmt.Errorf("create noise session failed: %w", err)
+			return fail(fmt.Errorf("dnstunnel: create noise session failed: %w", err))
 		}
 		t.noiseSession = ns
 		t.chunkSize = 22 // 22 bytes plain + 16 bytes AEAD tag = 38 bytes -> 61 Base32 chars (<= 63 DNS label limit)
@@ -771,11 +833,7 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 			break
 		}
 		if hsErr != nil {
-			cancel()
-			for _, p := range paths {
-				p.close()
-			}
-			return nil, fmt.Errorf("noise handshake exchange failed: %w", hsErr)
+			return fail(fmt.Errorf("dnstunnel: noise handshake exchange failed: %w", hsErr))
 		}
 		t.log.Infof("🔐 Established Noise_NK encryption session with server")
 	}
@@ -785,13 +843,9 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 	// and answers synchronously on this query, and dials its backend only once
 	// data flows. Sessions without a declared target still probe — that is how
 	// the default target transport is discovered.
-	transport, err := t.declareTarget(declaredTarget)
+	transport, err := t.declareTarget(p.declaredTarget)
 	if err != nil {
-		cancel()
-		for _, p := range paths {
-			p.close()
-		}
-		return nil, err
+		return fail(err)
 	}
 	t.transport = transport
 
@@ -826,7 +880,7 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 		t.events.publish(ClientEvent{
 			Kind:      ClientTunnelEstablished,
 			Session:   t.session,
-			Target:    declaredTarget,
+			Target:    p.declaredTarget,
 			Transport: t.transport,
 		})
 	}
@@ -843,7 +897,13 @@ func newDNSClientTunnel(ctx context.Context, servers []string, domain string, re
 // want Client.Dial instead, which is this constructor behind a reusable,
 // pre-validated Client.
 func NewDNSClientTunnel(ctx context.Context, servers []string, domain string, recordType string, pubKeyStr string) (*DNSClientTunnel, error) {
-	return newDNSClientTunnel(ctx, servers, domain, recordType, pubKeyStr, "", "", "", false, nopLogger, nil, nil, nil, nil)
+	return newDNSClientTunnel(ctx, clientTunnelParams{
+		servers:    servers,
+		domain:     domain,
+		recordType: recordType,
+		pubKey:     pubKeyStr,
+		log:        nopLogger,
+	})
 }
 
 // edns0Effective reports whether the server will actually size its answers against
@@ -889,13 +949,33 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 	return m
 }
 
-// qnameRandomCase applies 0x20 encoding: letters keep their case with 50/50
-// probability per character, digits and dots are untouched. Case is not
-// semantic for the tunnel parser (Everything is EqualFold + lowercase).
-func qnameRandomCase(name string) string {
-	b := []byte(name)
-	randomizeQNameCaseBytes(b)
-	return string(b)
+// errSpoofedAnswer is returned when a response fails the 0x20 case check: the
+// answer was not produced for this query (an off-path attacker cannot guess the
+// QNAME case bits the query carried).
+var errSpoofedAnswer = errors.New("dnstunnel: answer does not echo the query's QNAME case (possible spoofing)")
+
+// answerCaseOK validates that resp echoes the exact QNAME the query carried.
+// The case bits are randomized per query (buildQueryNameRandomized) and
+// unguessable to an off-path attacker, so they act as a per-query authentication
+// tag on the answer - the second entropy channel besides the 16-bit transaction
+// ID, and the only one that still carries entropy when the pooled UDP sockets
+// keep the source port fixed across queries. Responses that fail are refused;
+// after dnsTunnelCaseFailLimit consecutive failures the validation disables
+// itself for the session, because some resolver paths normalize QNAME case and
+// a spoofer cannot influence the case of legitimate answers.
+func (t *DNSClientTunnel) answerCaseOK(sent, resp *dns.Msg) bool {
+	if t.caseCheckDisabled.Load() {
+		return true
+	}
+	if resp != nil && len(resp.Question) > 0 && resp.Question[0].Name == sent.Question[0].Name {
+		t.caseFailStreak.Store(0)
+		return true
+	}
+	if t.caseFailStreak.Add(1) >= dnsTunnelCaseFailLimit {
+		t.caseCheckDisabled.Store(true)
+		t.log.Infof("session %s: upstream path normalizes QNAME case; 0x20 answer validation disabled", t.session)
+	}
+	return false
 }
 
 func (t *DNSClientTunnel) sendQuery(pathIdx int, flag byte, wirePayload []byte, dataSeq uint32) (int, error) {
@@ -928,6 +1008,15 @@ func (t *DNSClientTunnel) sendQueryContext(ctx context.Context, pathIdx int, fla
 	resp, err := t.paths[pathIdx].exchange(ctx, msg)
 	if err == nil {
 		t.observeRTT(time.Since(exchangeStart))
+		// 0x20 validation: the QNAME case bits are unguessable off-path, so an
+		// answer that does not echo them was not produced for this query. The
+		// pooled UDP sockets keep the source port fixed across queries, which
+		// leaves the random transaction ID as the only other blind spoofing
+		// barrier when Noise is off - the case check restores the second
+		// entropy channel.
+		if !t.answerCaseOK(msg, resp) {
+			return 0, errSpoofedAnswer
+		}
 	}
 	if t.debug {
 		answers := 0
@@ -1212,7 +1301,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 			// Not a framed chunk (legacy or truncated answer). Without a sequence
 			// number there is no nonce, so an authenticated chunk cannot be opened.
 			if noise {
-				t.log.Warnf("Short TXT frame (%d bytes) cannot be authenticated, dropped", len(raw))
+				t.warnDecrypt.warnf(t.log, dnsTunnelLogWindow, "Short TXT frame (%d bytes) cannot be authenticated, dropped", len(raw))
 				return 0
 			}
 			return t.writeInBuf(raw)
@@ -1222,13 +1311,28 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 		if noise {
 			dec, err := t.noiseSession.RecvCipher.Decrypt(uint64(serverSeq), tail)
 			if err != nil {
-				t.log.Warnf("Downstream frame serverSeq=%d failed to decrypt: %v", serverSeq, err)
+				t.warnDecrypt.warnf(t.log, dnsTunnelLogWindow, "Downstream frame serverSeq=%d failed to decrypt: %v", serverSeq, err)
 				return 0
 			}
 			payload = dec
 		}
 
 		t.recvMu.Lock()
+		if seqLess(t.seenHi, serverSeq) {
+			t.seenHi = serverSeq
+		}
+		// skipTo is the one header field the AEAD does not cover (the client
+		// needs serverSeq in the clear to rebuild the nonce; skipTo rides next
+		// to it unauthenticated). Tampering with it is therefore a DoS at
+		// worst, but a wild value must not fling recvNext across the whole
+		// stream in one shot: a legitimate skipTo is the server's next
+		// assignment and can only lead seenHi by the answers lost in flight -
+		// bounded by the advertised window. Anything further ahead is treated
+		// as corrupted rather than trusted. The header layout itself is a known
+		// trade-off documented at downstreamHeaderSize.
+		if d := skipTo - t.seenHi; skipTo != 0 && d > dnsTunnelMaxDownstreamWindow && d < 1<<31 {
+			skipTo = 0
+		}
 		// The server abandoned everything below skipTo: accept the gap rather than
 		// block forever on chunks that will never arrive.
 		if seqLess(t.recvNext, skipTo) {
@@ -1262,7 +1366,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 				delete(t.recvOOO, t.recvNext)
 				t.recvNext++
 			}
-			if delivered > 0 && t.inCond != nil {
+			if delivered > 0 {
 				t.inCond.Broadcast()
 			}
 			t.inMu.Unlock()
@@ -1274,7 +1378,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 			// reason).
 			if len(t.recvOOO) >= dnsTunnelDownstreamOOOCap ||
 				t.recvOOOBytes.Load()+int64(len(payload)) > dnsTunnelDownstreamOOOBytes {
-				t.log.Warnf("Downstream out-of-order buffer full (%d entries, %d bytes), dropping serverSeq=%d",
+				t.warnOOO.warnf(t.log, dnsTunnelLogWindow, "Downstream out-of-order buffer full (%d entries, %d bytes), dropping serverSeq=%d",
 					len(t.recvOOO), t.recvOOOBytes.Load(), serverSeq)
 			} else {
 				t.recvOOO[serverSeq] = append([]byte(nil), payload...)
@@ -1295,7 +1399,7 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 		seq := binary.BigEndian.Uint32(raw[:nonTxtNoiseHeaderSize])
 		dec, err := t.noiseSession.RecvCipher.Decrypt(uint64(seq), raw[nonTxtNoiseHeaderSize:])
 		if err != nil {
-			t.log.Warnf("Downstream chunk seq=%d failed to decrypt: %v", seq, err)
+			t.warnDecrypt.warnf(t.log, dnsTunnelLogWindow, "Downstream chunk seq=%d failed to decrypt: %v", seq, err)
 			return 0
 		}
 		return t.writeInBuf(dec)
@@ -1309,9 +1413,7 @@ func (t *DNSClientTunnel) writeInBuf(b []byte) int {
 	}
 	t.inMu.Lock()
 	n, _ := t.inBuf.Write(b)
-	if t.inCond != nil {
-		t.inCond.Broadcast()
-	}
+	t.inCond.Broadcast()
 	t.inMu.Unlock()
 	return n
 }
@@ -1398,7 +1500,7 @@ func (t *DNSClientTunnel) pollLoop(idx int, idle time.Duration) {
 		// beacon for traffic analysis. Spread each wait uniformly across
 		// [delay/2, delay*1.5) — the average is unchanged, the periodicity is
 		// gone.
-		delay = delay/2 + time.Duration(mrand.Int63n(int64(delay)+1))
+		delay = delay/2 + time.Duration(rand.Int64N(int64(delay)+1))
 		if !t.waitTimer(timer, delay) {
 			return
 		}
@@ -1465,13 +1567,7 @@ func (t *DNSClientTunnel) Read(p []byte) (int, error) {
 			return 0, os.ErrDeadlineExceeded
 		}
 
-		if t.inCond != nil {
-			t.inCond.Wait()
-		} else {
-			t.inMu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			t.inMu.Lock()
-		}
+		t.inCond.Wait()
 	}
 
 	return t.inBuf.Read(p)
@@ -1778,20 +1874,11 @@ func (t *DNSClientTunnel) closeWith(reason string, err error) {
 	}
 	close(t.doneCh)
 	t.inMu.Lock()
-	if t.inCond != nil {
-		t.inCond.Broadcast()
-	}
+	t.inCond.Broadcast()
 	t.inMu.Unlock()
 	if t.events != nil {
 		t.events.close()
 	}
-	// Tell the server on a detached goroutine. This used to run inline, which made
-	// every Close() - and every session death, including the ones raised from a
-	// failing poller - wait out a fresh DNS dial plus up to dnsTunnelCloseTimeout.
-	// An embedder closing many sessions on shutdown paid that serially, and a
-	// poller could not finish tearing the session down until the last close query
-	// timed out. The server also expires idle sessions, so a lost signal only
-	// shortens the session's life rather than leaking it.
 	// Tell the server on a detached goroutine. This used to run inline, which made
 	// every Close() - and every session death, including the ones raised from a
 	// failing poller - wait out a fresh DNS dial plus up to dnsTunnelCloseTimeout.
@@ -1834,12 +1921,29 @@ func (t *DNSClientTunnel) Err() error {
 // sendCloseSignal tells the server to tear down the session. It runs on a detached
 // deadline: cancelling the tunnel context would otherwise also prevent the close
 // query from ever leaving the host.
+//
+// The close rides a plaintext query name, so an unauthenticated close query
+// would let anyone who ever saw one QNAME kill the session with a single forged
+// query. The payload therefore authenticates it: with Noise it is a tag sealed
+// under the reserved close sequence (only the session key holder can produce
+// it); without Noise the PSK proof is attached when one is configured (off-path
+// protected; an on-path observer can replay it, which is inherent to plaintext
+// mode). Anonymous plaintext sessions keep the legacy payload-free close -
+// there is no shared secret to prove.
 func (t *DNSClientTunnel) sendCloseSignal() {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsTunnelCloseTimeout)
 	defer cancel()
 
+	var payload []byte
+	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
+		// Seal the empty plaintext: the 16-byte AEAD tag is a pure proof of key
+		// possession, bound to the reserved close sequence.
+		payload = t.noiseSession.SendCipher.Encrypt(uint64(dnsTunnelCloseSeq), nil)
+	} else if t.pskKey != nil {
+		payload = pskProof(t.pskKey, t.session)
+	}
 	seq := atomic.AddUint32(&t.seq, 1)
-	name := buildQueryName(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), 0, flagClose, nil)
+	name := buildQueryName(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), 0, flagClose, payload)
 	m := new(dns.Msg)
 	m.SetQuestion(name, t.qtype)
 	m.RecursionDesired = false
@@ -1900,12 +2004,21 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 		}
 		idx := t.nextServer()
 		exchangeStart := time.Now()
-		resp, err := t.paths[idx].exchange(t.ctx, t.buildQuery(dnsTunnelControlSeq, flagTarget, payload))
+		msg := t.buildQuery(dnsTunnelControlSeq, flagTarget, payload)
+		resp, err := t.paths[idx].exchange(t.ctx, msg)
 		if err == nil {
 			// This probe is the first successful exchange of an unauthenticated
 			// session, and adaptiveExchangeTimeout needs it: without a measurement
 			// the first data query would still wait out the configured ceiling.
 			t.observeRTT(time.Since(exchangeStart))
+			// A spoofed probe answer could lie about the transport; gate it the
+			// same way as data answers.
+			if !t.answerCaseOK(msg, resp) {
+				lastErr = errSpoofedAnswer
+				t.markPathFailed(idx)
+				t.sleep(dnsTunnelTargetBackoff * time.Duration(attempt+1))
+				continue
+			}
 		}
 		if err == nil && resp != nil {
 			for _, ans := range resp.Answer {
@@ -2030,9 +2143,7 @@ func (t *DNSClientTunnel) armDeadline(deadline time.Time) {
 
 func (t *DNSClientTunnel) wakeWaiters() {
 	t.inMu.Lock()
-	if t.inCond != nil {
-		t.inCond.Broadcast()
-	}
+	t.inCond.Broadcast()
 	t.inMu.Unlock()
 }
 
@@ -2117,7 +2228,7 @@ func randomSessionID() string {
 	if _, err := crand.Read(b[:]); err != nil {
 		// The CSPRNG never fails on modern platforms; fall back to the
 		// math/rand source rather than panicking the data path.
-		return fmt.Sprintf("%016x", mrand.Uint64())
+		return fmt.Sprintf("%016x", rand.Uint64())
 	}
 	return fmt.Sprintf("%016x", binary.BigEndian.Uint64(b[:]))
 }

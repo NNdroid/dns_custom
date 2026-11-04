@@ -52,6 +52,13 @@ func TestParseQueryNameRejectsMalformedInput(t *testing.T) {
 	}
 }
 
+// fitDownstreamPayload is the legacy-budget wrapper the linear-reference test
+// exercises. Production code sizes chunks against the negotiated budget via
+// fitDownstreamPayloadBudget directly.
+func fitDownstreamPayload(nameLen int, n int, qtype uint16) int {
+	return fitDownstreamPayloadBudget(nameLen, n, qtype, dnsTunnelMaxUDPResponse)
+}
+
 func TestFitDownstreamPayloadMatchesLinearReference(t *testing.T) {
 	qnames := []string{
 		buildQueryName("tunnel2", "t.example", "s", 1, 0, 0, flagPoll, nil),
@@ -112,7 +119,7 @@ func TestUnknownPollDoesNotCreateSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sess, created := srv.getOrCreateSession("unknown", 0, nil, false); sess != nil || created {
+	if sess, created := srv.getOrCreateSession("unknown", 0, nil, false, ""); sess != nil || created {
 		t.Fatalf("unknown poll returned session=%v created=%v", sess, created)
 	}
 	srv.mu.RLock()
@@ -124,7 +131,7 @@ func TestUnknownPollDoesNotCreateSession(t *testing.T) {
 }
 
 func TestServerBufferBackpressureWakesOnDrain(t *testing.T) {
-	sess := newDnsSession("backpressure", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	sess := newDnsSession("backpressure", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	sess.serverBuf.Write(make([]byte, dnsTunnelServerBufferLimit))
 	done := make(chan bool, 1)
 	go func() { done <- sess.pushServer([]byte{1}) }()
@@ -218,7 +225,7 @@ func TestClosedSessionIsRemovedImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess, created := srv.getOrCreateSession("closed-session", 1, []byte("x"), true)
+	sess, created := srv.getOrCreateSession("closed-session", 1, []byte("x"), true, "")
 	if sess == nil || !created {
 		t.Fatal("session was not created")
 	}
@@ -229,7 +236,7 @@ func TestClosedSessionIsRemovedImmediately(t *testing.T) {
 	if stillPresent {
 		t.Fatal("closed session remained addressable")
 	}
-	if got, created := srv.getOrCreateSession(sess.sessionID, 0, nil, false); got != nil || created {
+	if got, created := srv.getOrCreateSession(sess.sessionID, 0, nil, false, ""); got != nil || created {
 		t.Fatalf("closed session lookup = (%v, %v), want (nil, false)", got, created)
 	}
 }
@@ -239,7 +246,7 @@ func TestClosedSessionIsRetainedUntilDownstreamTailDrains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sess, created := srv.getOrCreateSession("closed-tail", 1, []byte("x"), true)
+	sess, created := srv.getOrCreateSession("closed-tail", 1, []byte("x"), true, "")
 	if sess == nil || !created || !sess.pushServer([]byte("tail")) {
 		t.Fatal("session with downstream tail was not prepared")
 	}

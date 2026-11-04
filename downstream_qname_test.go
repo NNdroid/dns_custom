@@ -8,7 +8,7 @@ import (
 )
 
 func TestLongDataQNameDoesNotPoisonLaterPoll(t *testing.T) {
-	s := newDnsSession("0123456789abcdef", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	s := newDnsSession("0123456789abcdef", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	payload := bytes.Repeat([]byte{0x5a}, 96)
 	if !s.pushServer(payload) {
 		t.Fatal("pushServer rejected payload")
@@ -31,7 +31,7 @@ func TestLongDataQNameDoesNotPoisonLaterPoll(t *testing.T) {
 }
 
 func TestOversizedRetransmitWaitsForShortPoll(t *testing.T) {
-	s := newDnsSession("0123456789abcdef", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	s := newDnsSession("0123456789abcdef", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	payload := bytes.Repeat([]byte{0xa5}, 160)
 	if !s.pushServer(payload) {
 		t.Fatal("pushServer rejected payload")
@@ -70,7 +70,7 @@ func TestEncryptedRetransmitPreservesChunkAcrossQNameBudgets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := newDnsSession("0123456789abcdef", "tcp", "127.0.0.1:1", false, &NoiseSession{SendCipher: send}, nopLogger, nil)
+	s := newDnsSession("0123456789abcdef", "", "tcp", "127.0.0.1:1", false, &NoiseSession{SendCipher: send}, nopLogger, nil)
 	payload := bytes.Repeat([]byte{0xa5}, 160)
 	if !s.pushServer(payload) {
 		t.Fatal("pushServer rejected payload")

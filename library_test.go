@@ -333,7 +333,7 @@ func TestLegacyDatagramSessionAgainstTCPTargetRefusedAtDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDNSServer failed: %v", err)
 	}
-	sess, created := srv.getOrCreateSession(udpSessionPrefix+"abcd1234", 1, nil, true)
+	sess, created := srv.getOrCreateSession(udpSessionPrefix+"abcd1234", 1, nil, true, "")
 	if sess == nil || !created {
 		t.Fatalf("marker session was not created: sess=%v created=%v", sess, created)
 	}
@@ -350,7 +350,7 @@ func TestLegacyDatagramSessionAgainstTCPTargetRefusedAtDial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDNSServer failed: %v", err)
 	}
-	sess, created = okSrv.getOrCreateSession(udpSessionPrefix+"abcd1234", 1, nil, true)
+	sess, created = okSrv.getOrCreateSession(udpSessionPrefix+"abcd1234", 1, nil, true, "")
 	if sess == nil || !created {
 		t.Fatalf("UDP session against udp:// target was rejected: sess=%v created=%v", sess, created)
 	}
@@ -587,15 +587,15 @@ func TestMaxSessionsCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDNSServer failed: %v", err)
 	}
-	s1, created := srv.getOrCreateSession("aaaa", 1, nil, true)
+	s1, created := srv.getOrCreateSession("aaaa", 1, nil, true, "")
 	if !created {
 		t.Fatal("session 1 was not created")
 	}
-	s2, created := srv.getOrCreateSession("bbbb", 1, nil, true)
+	s2, created := srv.getOrCreateSession("bbbb", 1, nil, true, "")
 	if !created {
 		t.Fatal("session 2 was not created")
 	}
-	if s3, created := srv.getOrCreateSession("cccc", 1, nil, true); s3 != nil || created {
+	if s3, created := srv.getOrCreateSession("cccc", 1, nil, true, ""); s3 != nil || created {
 		t.Fatal("session 3 was created despite the cap")
 	}
 	// Closing one frees a slot.
@@ -603,7 +603,7 @@ func TestMaxSessionsCap(t *testing.T) {
 	srv.mu.Lock()
 	delete(srv.sessions, "aaaa")
 	srv.mu.Unlock()
-	s3, created := srv.getOrCreateSession("dddd", 1, nil, true)
+	s3, created := srv.getOrCreateSession("dddd", 1, nil, true, "")
 	if s3 == nil || !created {
 		t.Fatal("session 4 was not created after a slot freed up")
 	}

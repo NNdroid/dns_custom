@@ -471,7 +471,7 @@ func benchmarkWeakLink(b *testing.B, p weakLinkProfile) {
 				retries.Add(1)
 			}
 		})
-		tunnel, err := newDNSClientTunnel(ctx, []string{link.Addr()}, domain, "txt", "", "", "", "", false, nopLogger, nil, nil, ev, nil)
+		tunnel, err := newTestTunnelSession(ctx, []string{link.Addr()}, domain, "", false, ev)
 		if err != nil {
 			ev.close()
 			b.Fatalf("session setup over %s failed: %v", p.name, err)

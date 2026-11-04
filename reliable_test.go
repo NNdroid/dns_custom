@@ -2,6 +2,7 @@ package dnstunnel
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,7 +13,7 @@ import (
 // TestServerUpstreamReassembly verifies the server dedups duplicates and delivers
 // out-of-order upstream chunks strictly in dataSeq order to the backend.
 func TestServerUpstreamReassembly(t *testing.T) {
-	sess := newDnsSession("test", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	sess := newDnsSession("test", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	// newDnsSession starts clientNext=1, so the first data chunk is dataSeq=1.
 
 	// Deliver out of order, then a duplicate of an already-delivered chunk.
@@ -40,6 +41,7 @@ func TestClientDownstreamReassembly(t *testing.T) {
 		recvNext: 1,
 		recvOOO:  make(map[uint32][]byte),
 	}
+	tun.inCond = sync.NewCond(&tun.inMu)
 
 	tun.deliverDownstream(encodeDownstreamFrame(1, 0, []byte("AAAA")))
 	tun.deliverDownstream(encodeDownstreamFrame(3, 0, []byte("CCCC")))
@@ -71,6 +73,7 @@ func TestClientDownstreamOOOCap(t *testing.T) {
 		recvOOO:  make(map[uint32][]byte),
 		log:      nopLogger,
 	}
+	tun.inCond = sync.NewCond(&tun.inMu)
 
 	const chunkLen = 10
 	// serverSeq=1 is never sent, so every chunk lands out of order.
@@ -117,7 +120,7 @@ const testPollQName = "1.0.P.0.-.0123456789abcdef.tunnel.test.local"
 // retransmitted, but once it ages past the give-up window it is abandoned and the
 // server tells the client to skip forward instead of blocking the stream forever.
 func TestServerDownstreamRetransmitThenGiveUp(t *testing.T) {
-	sess := newDnsSession("test", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	sess := newDnsSession("test", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	sess.serverBuf.WriteString("AAAA")
 
 	// First serve: seq=1, retained in serverOut pending the client's ACK.
@@ -208,10 +211,12 @@ func TestSeqLessWraparound(t *testing.T) {
 }
 
 func newTestTunnel() *DNSClientTunnel {
-	return &DNSClientTunnel{
+	tun := &DNSClientTunnel{
 		qtype:    dns.TypeTXT,
 		inBuf:    new(bytes.Buffer),
 		recvNext: 1,
 		recvOOO:  make(map[uint32][]byte),
 	}
+	tun.inCond = sync.NewCond(&tun.inMu)
+	return tun
 }

@@ -31,6 +31,12 @@ const dnsTunnelServerBufferLimit = 512 * 1024
 // session's reorder map without bound.
 const dnsTunnelUpstreamOOOCap = 4096
 
+// dnsTunnelUpstreamOOOBytes bounds the same buffer in bytes, mirroring
+// dnsTunnelDownstreamOOOBytes on the client: the count cap alone would let one
+// session pin ~1 MB even with every entry near the chunk-size ceiling, and a
+// flood of fresh sessions multiplies that by MaxSessions.
+const dnsTunnelUpstreamOOOBytes = 1 << 20
+
 // dnsTunnelRetransmitBytes bounds the downstream retransmission buffer per
 // session in bytes. The advertised window bounds the chunk COUNT, but with
 // 8 KiB TCP chunks count alone would allow one session to pin megabytes here.
@@ -61,6 +67,10 @@ type ServerConfig struct {
 	// must carry a valid HMAC proof derived from one of these shared secrets,
 	// and data for unauthenticated sessions is refused. Empty = anonymous
 	// clients may use the default target (declarations still require Noise).
+	// Boundary: the proof gates session creation and close signals, not stream
+	// integrity — an on-path observer of a plaintext session can replay the
+	// visible proof and inject chunks. Use PrivateKey (Noise) for
+	// confidentiality and per-chunk AEAD integrity.
 	PSKs []string `json:"psks,omitempty"`
 	// Marker customizes the tunnel marker label; BOTH ends must agree.
 	// Empty uses the built-in "tunnel2" default.
@@ -209,6 +219,14 @@ type DNSServer struct {
 	// serialize all of them behind one exclusive lock.
 	limMu sync.Mutex
 	log   *zap.SugaredLogger
+
+	// Warn throttlers for conditions an attacker can trigger at query rate.
+	// Each triggering query used to cost one log line, which turned the data
+	// path into a log-flood disk DoS; the throttlers keep one line per window
+	// (with the suppressed count) instead.
+	warnSessionCap warnThrottle
+	warnDecrypt    warnThrottle
+	warnOOO        warnThrottle
 }
 
 // SetEventHandler installs or replaces the server event handler (nil disables
@@ -256,7 +274,11 @@ func (s *Server) Close() error {
 }
 
 type dnsSession struct {
-	sessionID      string
+	sessionID string
+	// remoteAddr is the resolver-side address the session's first query arrived
+	// from ("" when unknown). Immutable after creation, so event publishing can
+	// read it without a lock. SIEM consumers correlate attack signals by source.
+	remoteAddr     string
 	targetNetwork  string
 	targetAddr     string
 	wantsDatagram  bool // legacy marker in the session ID (old DialUDP clients)
@@ -287,7 +309,8 @@ type dnsSession struct {
 
 	// Reliable-ordered transport: dedup plus in-order reassembly in both directions.
 	clientNext       uint32                      // next in-order upstream dataSeq expected from client
-	clientOOO        map[uint32][]byte           // out-of-order upstream data chunks buffered for later in-order delivery
+	clientOOO        map[uint32][]byte           // out-of-order upstream dataSeq chunks buffered for later in-order delivery
+	clientOOOBytes   int                         // total bytes held in clientOOO (caller holds mu)
 	serverNext       uint32                      // next downstream serverSeq to assign
 	serverOut        map[uint32]*downstreamChunk // un-acked downstream chunks kept for retransmission
 	serverOutOrder   []uint32                    // FIFO of serverOut keys; front == oldest (caller holds mu)
@@ -306,9 +329,10 @@ type downstreamChunk struct {
 	firstSent time.Time
 }
 
-func newDnsSession(sessionID, targetNetwork, targetAddr string, wantsDatagram bool, noiseSess *NoiseSession, log *zap.SugaredLogger, server *DNSServer) *dnsSession {
+func newDnsSession(sessionID, remoteAddr, targetNetwork, targetAddr string, wantsDatagram bool, noiseSess *NoiseSession, log *zap.SugaredLogger, server *DNSServer) *dnsSession {
 	sess := &dnsSession{
 		sessionID:     sessionID,
+		remoteAddr:    remoteAddr,
 		targetNetwork: targetNetwork,
 		targetAddr:    targetAddr,
 		wantsDatagram: wantsDatagram,
@@ -353,6 +377,7 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 			s.server.publishEvent(ServerEvent{
 				Kind:      ServerReplayDropped,
 				SessionID: s.sessionID,
+				Remote:    s.remoteAddr,
 				Detail:    "duplicate chunk below the in-order window",
 			})
 		}
@@ -364,6 +389,7 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 				s.server.publishEvent(ServerEvent{
 					Kind:      ServerReplayDropped,
 					SessionID: s.sessionID,
+					Remote:    s.remoteAddr,
 					Detail:    "duplicate chunk already buffered out-of-order",
 				})
 			}
@@ -377,7 +403,14 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 		// decrypt independently, which is what makes concurrent paths safe.
 		dec, err := s.noiseSession.RecvCipher.Decrypt(uint64(seq), data)
 		if err != nil {
-			s.log.Warnf("[%s] Noise decryption failed for dataSeq=%d: %v", s.sessionID, seq, err)
+			// A hostile party who knows the session ID (it rides plaintext query
+			// names) can feed garbage ciphertext at query rate; throttle the
+			// warning so the flood cannot become a disk DoS.
+			if s.server != nil {
+				s.server.warnDecrypt.warnf(s.log, dnsTunnelLogWindow, "[%s] Noise decryption failed for dataSeq=%d: %v", s.sessionID, seq, err)
+			} else {
+				s.log.Warnf("[%s] Noise decryption failed for dataSeq=%d: %v", s.sessionID, seq, err)
+			}
 			return
 		}
 		payload = dec
@@ -392,16 +425,25 @@ func (s *dnsSession) pushClient(seq uint32, data []byte) {
 				break
 			}
 			s.clientBuf.Write(c)
+			s.clientOOOBytes -= len(c)
 			delete(s.clientOOO, s.clientNext)
 			s.clientNext++
 		}
 	} else {
 		if _, exists := s.clientOOO[seq]; !exists {
-			if len(s.clientOOO) >= dnsTunnelUpstreamOOOCap {
-				s.log.Warnf("[%s] Out-of-order upstream buffer full (%d entries), dropping dataSeq=%d", s.sessionID, len(s.clientOOO), seq)
+			// Bound the reorder buffer in entries AND bytes (the client bounds
+			// its mirror of this buffer the same way): a flood of fresh sessions
+			// multiplies whatever one session may pin.
+			if len(s.clientOOO) >= dnsTunnelUpstreamOOOCap || s.clientOOOBytes+len(payload) > dnsTunnelUpstreamOOOBytes {
+				if s.server != nil {
+					s.server.warnOOO.warnf(s.log, dnsTunnelLogWindow, "[%s] Out-of-order upstream buffer full (%d entries, %d bytes), dropping dataSeq=%d", s.sessionID, len(s.clientOOO), s.clientOOOBytes, seq)
+				} else {
+					s.log.Warnf("[%s] Out-of-order upstream buffer full (%d entries, %d bytes), dropping dataSeq=%d", s.sessionID, len(s.clientOOO), s.clientOOOBytes, seq)
+				}
 				return
 			}
 			s.clientOOO[seq] = append([]byte(nil), payload...)
+			s.clientOOOBytes += len(payload)
 		}
 	}
 	s.lastActive.Store(time.Now().Unix())
@@ -676,6 +718,7 @@ func (s *dnsSession) close() {
 			s.server.publishEvent(ServerEvent{
 				Kind:      ServerSessionClosed,
 				SessionID: s.sessionID,
+				Remote:    s.remoteAddr,
 			})
 		}
 	})
@@ -772,7 +815,7 @@ func (s *DNSServer) validPSKProof(sessionID string, proof []byte) bool {
 	return false
 }
 
-func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData []byte, allowCreate bool) (*dnsSession, bool) {
+func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData []byte, allowCreate bool, remote string) (*dnsSession, bool) {
 	s.mu.RLock()
 	if sess, ok := s.sessions[sessionID]; ok {
 		s.mu.RUnlock()
@@ -797,7 +840,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 		full := len(s.sessions) >= s.cfg.MaxSessions
 		s.mu.RUnlock()
 		if full {
-			s.log.Warnf("[%s] Rejected: session limit reached (%d)", sessionID, s.cfg.MaxSessions)
+			s.warnSessionCap.warnf(s.log, dnsTunnelLogWindow, "[%s] Rejected: session limit reached (%d)", sessionID, s.cfg.MaxSessions)
 			return nil, false
 		}
 	}
@@ -820,6 +863,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 			s.publishEvent(ServerEvent{
 				Kind:      ServerAuthRejected,
 				SessionID: sessionID,
+				Remote:    remote,
 				Detail:    "first packet missing the 32-byte Noise ephemeral key",
 			})
 			return nil, false
@@ -832,6 +876,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 			s.publishEvent(ServerEvent{
 				Kind:      ServerAuthRejected,
 				SessionID: sessionID,
+				Remote:    remote,
 				Detail:    "noise handshake failed",
 			})
 			return nil, false
@@ -842,7 +887,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 		s.log.Infof("[%s] 🔐 Established Noise_NK encrypted channel", sessionID)
 	}
 
-	sess := newDnsSession(sessionID, targetNet, targetAddr, wantsDatagram, noiseSess, s.log, s)
+	sess := newDnsSession(sessionID, remote, targetNet, targetAddr, wantsDatagram, noiseSess, s.log, s)
 
 	if s.hasPrivKey {
 		sess.pushClient(seq, initialPayload)
@@ -865,7 +910,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 	// session IDs cannot grow the map (and its per-session buffers) unbounded.
 	if s.cfg.MaxSessions > 0 && len(s.sessions) >= s.cfg.MaxSessions {
 		s.mu.Unlock()
-		s.log.Warnf("[%s] Rejected: session limit reached (%d)", sessionID, s.cfg.MaxSessions)
+		s.warnSessionCap.warnf(s.log, dnsTunnelLogWindow, "[%s] Rejected: session limit reached (%d)", sessionID, s.cfg.MaxSessions)
 		return nil, false
 	}
 	s.sessions[sessionID] = sess
@@ -874,6 +919,7 @@ func (s *DNSServer) getOrCreateSession(sessionID string, seq uint32, initialData
 	s.publishEvent(ServerEvent{
 		Kind:      ServerSessionCreated,
 		SessionID: sessionID,
+		Remote:    remote,
 	})
 	return sess, true
 }
@@ -984,30 +1030,7 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 
 	sess.log.Infof("[%s] 🔗 Connected to TCP target (%s)", sess.sessionID, addr)
 
-	go func() {
-		defer s.guardSessionGoroutine("backend pump", sess)
-		defer sess.close()
-		buf := make([]byte, 4096)
-		for {
-			sess.mu.Lock()
-			for sess.clientBuf.Len() == 0 && !sess.closed {
-				sess.waitForClientData()
-			}
-			if sess.closed {
-				sess.mu.Unlock()
-				return
-			}
-			n, _ := sess.clientBuf.Read(buf)
-			sess.mu.Unlock()
-
-			if n > 0 {
-				if _, err := conn.Write(buf[:n]); err != nil {
-					sess.log.Warnf("[%s] Write to target failed: %v", sess.sessionID, err)
-					return
-				}
-			}
-		}
-	}()
+	go s.pumpClientBufToConn(sess, conn, "TCP")
 
 	go func() {
 		defer s.guardSessionGoroutine("backend pump", sess)
@@ -1030,34 +1053,40 @@ func (s *DNSServer) startBackendForwarder(sess *dnsSession) {
 	}()
 }
 
+// pumpClientBufToConn drains the reassembled upstream byte stream into a stream
+// backend: the TCP forwarder's upstream half, and the same loop reused by the
+// legacy unframed UDP mode. It exits when the session closes or the backend
+// write fails; sess.close() tears the session's other halves down with it.
+func (s *DNSServer) pumpClientBufToConn(sess *dnsSession, conn net.Conn, targetKind string) {
+	defer s.guardSessionGoroutine("backend pump", sess)
+	defer sess.close()
+	buf := make([]byte, 4096)
+	for {
+		sess.mu.Lock()
+		for sess.clientBuf.Len() == 0 && !sess.closed {
+			sess.waitForClientData()
+		}
+		if sess.closed {
+			sess.mu.Unlock()
+			return
+		}
+		n, _ := sess.clientBuf.Read(buf)
+		sess.mu.Unlock()
+
+		if n > 0 {
+			if _, err := conn.Write(buf[:n]); err != nil {
+				sess.log.Warnf("[%s] Write to %s target failed: %v", sess.sessionID, targetKind, err)
+				return
+			}
+		}
+	}
+}
+
 // startUDPLegacyForwarder forwards the session byte stream to a UDP backend without
 // datagram framing (pre-UDP-dial behavior, kept for compatibility with older
 // clients). Datagram boundaries are not preserved in this mode.
 func (s *DNSServer) startUDPLegacyForwarder(sess *dnsSession, conn net.Conn) {
-	go func() {
-		defer s.guardSessionGoroutine("backend pump", sess)
-		defer sess.close()
-		buf := make([]byte, 4096)
-		for {
-			sess.mu.Lock()
-			for sess.clientBuf.Len() == 0 && !sess.closed {
-				sess.waitForClientData()
-			}
-			if sess.closed {
-				sess.mu.Unlock()
-				return
-			}
-			n, _ := sess.clientBuf.Read(buf)
-			sess.mu.Unlock()
-
-			if n > 0 {
-				if _, err := conn.Write(buf[:n]); err != nil {
-					sess.log.Warnf("[%s] Write to UDP target failed: %v", sess.sessionID, err)
-					return
-				}
-			}
-		}
-	}()
+	go s.pumpClientBufToConn(sess, conn, "UDP")
 
 	s.pumpUDPToSession(sess, conn, false)
 }
@@ -1145,6 +1174,7 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if !s.allowQuery(w.RemoteAddr()) {
 		return
 	}
+	remote := remoteAddrString(w.RemoteAddr())
 	sessionID, _, ack, dataSeq, flag, data, err := parseQueryNameForMarkers(s.domain, s.domainLabels, q.Name, s.markerSet)
 	if err != nil {
 		s.log.Debugf("Non-tunnel query or parse failed: %s (%v)", q.Name, err)
@@ -1166,7 +1196,7 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// it creates the session shell; with Noise the handshake must come first, so
 	// unknown IDs are refused and the client retries after the handshake lands.
 	if flag == flagTarget {
-		sess, _ := s.getOrCreateSession(sessionID, 0, nil, !s.hasPrivKey)
+		sess, _ := s.getOrCreateSession(sessionID, 0, nil, !s.hasPrivKey, remote)
 		if sess == nil {
 			reply.SetRcode(req, dns.RcodeNameError)
 			_ = w.WriteMsg(reply)
@@ -1183,7 +1213,7 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// state: sessions are created (noise handshake) or authenticated (PSK
 	// probe) through their T exchange instead.
 	pskGate := len(s.pskKeys) > 0 && !s.hasPrivKey
-	sess, isNew := s.getOrCreateSession(sessionID, dataSeq, data, flag == flagData && len(data) > 0 && !pskGate)
+	sess, isNew := s.getOrCreateSession(sessionID, dataSeq, data, flag == flagData && len(data) > 0 && !pskGate, remote)
 	if s.debug {
 		s.log.Debugf("SERVEDNS flag=%q dataSeq=%d dataLen=%d isNew=%v hasPriv=%v", string(rune(flag)), dataSeq, len(data), isNew, s.hasPrivKey)
 	}
@@ -1236,10 +1266,10 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 		}
 	} else if flag == flagClose {
-		// Teardown is authenticated on PSK servers just like data: session IDs
-		// ride plaintext query names, so an observer who learns one could
-		// otherwise kill a paid session with a single forged close query.
-		if len(s.pskKeys) > 0 && !sess.authenticated() {
+		// Teardown is authenticated: session IDs ride plaintext query names, so
+		// an unauthenticated close would let anyone who saw one QNAME kill a
+		// paid session with a single forged query.
+		if !s.closeAllowed(sess, data) {
 			reply.SetRcode(req, dns.RcodeNameError)
 			_ = w.WriteMsg(reply)
 			return
@@ -1371,6 +1401,7 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 			s.publishEvent(ServerEvent{
 				Kind:      ServerTargetDenied,
 				SessionID: sess.sessionID,
+				Remote:    sess.remoteAddr,
 				Target:    network + "://" + addr,
 			})
 			status = targetStatusDeny
@@ -1393,6 +1424,40 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 		reply.Answer = append(reply.Answer, rr)
 	}
 	_ = w.WriteMsg(reply)
+}
+
+// closeAllowed verifies a teardown signal against the session's authentication
+// level. Noise sessions must carry a payload sealed under the reserved close
+// sequence; a legacy payload-free close of a Noise session is refused outright.
+// That intentionally trades the polite early close of legacy clients for
+// closing a forgery hole: a refused close merely leaves the session to idle
+// expiry, while an unauthenticated close let anyone who saw one QNAME kill it.
+// PSK-only sessions require the same HMAC proof the capability probe carries -
+// it binds the close to a secret-holder against off-path attackers (an on-path
+// observer can replay it, inherent to plaintext mode). Anonymous plaintext
+// sessions keep the legacy unauthenticated close: there is no shared secret to
+// prove.
+func (s *DNSServer) closeAllowed(sess *dnsSession, data []byte) bool {
+	if sess.noiseSession != nil && sess.noiseSession.RecvCipher != nil {
+		if _, err := sess.noiseSession.RecvCipher.Decrypt(uint64(dnsTunnelCloseSeq), data); err != nil {
+			s.warnDecrypt.warnf(sess.log, dnsTunnelLogWindow, "[%s] refused close without a valid Noise seal", sess.sessionID)
+			return false
+		}
+		return true
+	}
+	if len(s.pskKeys) > 0 {
+		if len(data) != pskProofLen || !s.validPSKProof(sess.sessionID, data) {
+			s.publishEvent(ServerEvent{
+				Kind:      ServerAuthRejected,
+				SessionID: sess.sessionID,
+				Remote:    sess.remoteAddr,
+				Detail:    "close query without a valid PSK proof",
+			})
+			return false
+		}
+		return true
+	}
+	return true
 }
 
 // guardSessionGoroutine turns a panic in a long-lived server goroutine into a
@@ -1513,18 +1578,16 @@ func (s *DNSServer) allowQuery(remote net.Addr) bool {
 	lim, ok := s.limiters[key]
 	if !ok {
 		if len(s.limiters) >= dnsTunnelMaxTrackedSources {
-			// Table full (typically a spoofed-source flood): evict the least
-			// recently used entry instead of refusing every new source until
-			// the next cleanup pass, so legitimate clients keep working.
-			var oldestKey srcKey
-			var oldest time.Time
-			first := true
-			for k, v := range s.limiters {
-				if first || v.last.Before(oldest) {
-					oldestKey, oldest, first = k, v.last, false
-				}
+			// Table full (typically a spoofed-source flood): evict an arbitrary
+			// entry (Go map iteration order is randomized) so legitimate new
+			// sources keep working. An exact least-recently-used scan over the
+			// whole table would turn every query of the flood into O(65536)
+			// work - a cheap-packet-to-CPU amplifier. Rate limiting only needs
+			// an approximately fair eviction, not an exact LRU.
+			for k := range s.limiters {
+				delete(s.limiters, k)
+				break
 			}
-			delete(s.limiters, oldestKey)
 		}
 		s.limiters[key] = &srcLimiter{tokens: float64(rate), last: now}
 		return true
@@ -1574,6 +1637,17 @@ func remoteAddrKey(remote net.Addr) (key srcKey) {
 	sum := sha256.Sum256([]byte(remote.String()))
 	copy(key[1:], sum[:16])
 	return key
+}
+
+// remoteAddrString renders a remote address for event payloads ("" when the
+// writer has no address). Event publishing happens deep inside session code
+// where no dns.ResponseWriter is available, so ServeDNS passes the rendered
+// string down and sessions store it once.
+func remoteAddrString(ra net.Addr) string {
+	if ra == nil {
+		return ""
+	}
+	return ra.String()
 }
 
 func mapTargetNetwork(wantUDP bool) string {

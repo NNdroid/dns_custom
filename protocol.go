@@ -141,6 +141,14 @@ const (
 // nonce; a stream would need 4 billion chunks (~137 GB) to reach it.
 const dnsTunnelControlSeq = ^uint32(0)
 
+// dnsTunnelCloseSeq is a second reserved sequence, used only by authenticated
+// close payloads. It must differ from dnsTunnelControlSeq: the AEAD nonce is
+// derived from the sequence, and sealing two different plaintexts (a close tag
+// vs a target declaration) under the same nonce and key would reuse the
+// keystream. Like dnsTunnelControlSeq it is unreachable by data chunks short of
+// ~4 billion of them.
+const dnsTunnelCloseSeq = ^uint32(0) - 1
+
 // seqLess compares two sequence numbers safely across uint32 wraparound.
 // Plain `<` would misread a fresh chunk as a stale duplicate once the counter
 // wraps, silently killing the stream.
@@ -211,7 +219,13 @@ func qTypeToDnsType(qtype uint16) string {
 //
 // The header is always plaintext, and with Noise enabled only the payload is
 // encrypted (nonce = serverSeq). The header has to stay readable: it carries the
-// sequence number the client needs to reconstruct the nonce.
+// sequence number the client needs to reconstruct the nonce. serverSeq therefore
+// protects itself (a tampered value fails AEAD verification), while skipTo rides
+// unauthenticated - a known trade-off: tampering with skipTo can only make the
+// client abandon buffered chunks early, i.e. a stream-corruption DoS an on-path
+// attacker could equally achieve by dropping responses, and the client clamps
+// skipTo to the window it advertises so a wild value cannot fling the read
+// position across the stream (see deliverDownstream).
 const downstreamHeaderSize = 8
 
 // Non-TXT frames carry no skipTo (best-effort, no retransmission) and only exist
@@ -245,14 +259,6 @@ func encodedRdataSize(n int, qtype uint16) int {
 		// CNAME / MX / SRV / NS: a single base32 label -> one length byte + chars.
 		return 1 + (n*8+4)/5
 	}
-}
-
-// fitDownstreamPayload shrinks n until the complete answer fits inside a plain
-// 512-byte UDP response. The query name is echoed in the answer, so a data query -
-// which carries the upstream chunk inside its name - leaves much less room for the
-// downstream payload than a short poll does.
-func fitDownstreamPayload(nameLen int, n int, qtype uint16) int {
-	return fitDownstreamPayloadBudget(nameLen, n, qtype, dnsTunnelMaxUDPResponse)
 }
 
 // fitDownstreamPayloadBudget is fitDownstreamPayload with a caller-supplied
@@ -321,10 +327,6 @@ func maxDownstreamPayloadBudget(qtype uint16, noise bool, nameLen int, udpBudget
 	return avail
 }
 
-// downstreamCap is the largest plaintext payload one answer of the given record
-// type can carry. Serving more than this silently truncates the chunk (A/AAAA only
-// hold one address, and label-based records are bounded by the 63-byte DNS label
-// limit), so the sender must chunk to the record type, not to a fixed 32 bytes.
 // downstreamCap is the largest plaintext payload one answer of the given record
 // type can carry under the legacy 512-byte budget. Serving more than this
 // silently truncates the chunk (A/AAAA only hold one address, and label-based
@@ -424,15 +426,8 @@ func markerSetFor(marker string) []string {
 	return []string{m}
 }
 
-// parseQueryName parses a query name using the default marker set.
-func parseQueryName(domain, name string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
-	return parseQueryNameForMarkers(domain, len(dns.SplitDomainName(domain)), name, markerSetFor(""))
-}
-
-func parseQueryNameForDomain(domain string, domainLabelCount int, name string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
-	return parseQueryNameForMarkers(domain, domainLabelCount, name, markerSetFor(""))
-}
-
+// parseQueryNameForMarkers parses a tunnel query name against an explicit
+// marker set and the authoritative domain's label count.
 func parseQueryNameForMarkers(domain string, domainLabelCount int, name string, markers []string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
 	domain = dns.Fqdn(domain)
 	if len(name) <= len(domain) || !strings.EqualFold(name[len(name)-len(domain):], domain) {

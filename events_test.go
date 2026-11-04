@@ -310,7 +310,7 @@ func TestServerEventSecurityKinds(t *testing.T) {
 		t.Fatal(err)
 	}
 	evSrv.events = dispatcher
-	sess := newDnsSession("sec.test", "tcp", "127.0.0.1:1", false, nil, nopLogger, evSrv)
+	sess := newDnsSession("sec.test", "203.0.113.7:5353", "tcp", "127.0.0.1:1", false, nil, nopLogger, evSrv)
 	// ReplayDropped: the same seq delivered twice.
 	sess.pushClient(1, []byte("first"))
 	sess.pushClient(1, []byte("replay"))
@@ -344,7 +344,7 @@ func TestServerEventSecurityKinds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("sanity AuthRejected never arrived")
 	}
-	if sess, created := authSrv.getOrCreateSession("badauth", 1, []byte("short"), true); sess != nil || created {
+	if sess, created := authSrv.getOrCreateSession("badauth", 1, []byte("short"), true, "203.0.113.7:5353"); sess != nil || created {
 		t.Fatal("short first packet was accepted on a Noise server")
 	}
 	select {

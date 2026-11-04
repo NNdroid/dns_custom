@@ -1,11 +1,38 @@
 package dnstunnel
 
 import (
+	"context"
 	"net"
 	"testing"
 
 	"github.com/miekg/dns"
 )
+
+// parseQueryName is a test convenience wrapper for parseQueryNameForMarkers
+// with the built-in marker set. Production code calls parseQueryNameForMarkers
+// directly with the server's configured marker set.
+func parseQueryName(domain, name string) (session string, querySeq, ack, dataSeq uint32, flag byte, data []byte, err error) {
+	return parseQueryNameForMarkers(domain, len(dns.SplitDomainName(domain)), name, markerSetFor(""))
+}
+
+// newTestTunnel opens a tunnel session with the defaults the test matrix uses
+// (TXT record type, no Noise, silent logger). Knobs beyond that stay opt-in:
+// pass tunnel options, or build clientTunnelParams directly for exotic cases.
+func newTestTunnelSession(ctx context.Context, servers []string, domain, sessionPrefix string, edns bool, events *eventDispatcher[ClientEvent], opts ...tunnelOption) (*DNSClientTunnel, error) {
+	p := clientTunnelParams{
+		servers:       servers,
+		domain:        domain,
+		recordType:    "txt",
+		sessionPrefix: sessionPrefix,
+		edns0:         edns,
+		log:           nopLogger,
+		events:        events,
+	}
+	for _, o := range opts {
+		o(&p.tuning)
+	}
+	return newDNSClientTunnel(ctx, p)
+}
 
 // startTestDNSServer binds before returning, avoiding fixed-port collisions and
 // readiness sleeps throughout the integration tests.
