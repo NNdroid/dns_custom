@@ -5,16 +5,19 @@
     "listen": "Local address to bind for local applications; its transport follows the target automatically",
     "target": "Optional backend declaration: tcp://host:port or udp://host:port; must pass the server allow_targets list (omit to use the server default)",
     "edns0": "Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)",
+    "marker": "Tunnel marker label; BOTH ends must agree. Empty = built-in 'tunnel2'",
     "domain": "Authoritative DNS tunnel domain matching the server domain",
     "servers": "Upstream DNS resolvers (supports standard UDP/TCP :53, DoT tls://, and DoH https://)",
     "record_type": "DNS query record type: txt (recommended), null, cname, a, aaaa, mx, srv, ns",
     "pubkey": "Server Noise Curve25519 static public key for end-to-end AEAD encryption",
+    "psk": "Pre-shared secret for PSK-authenticated servers (server 'psks' list); empty = anonymous",
     "log_level": "Logging verbosity: debug, info, warn, error"
   },
   "mode": "client",
   "listen": "127.0.0.1:1080",
   "target": "",
   "edns0": false,
+  "marker": "",
   "domain": "tunnel.example.com",
   "servers": [
     "8.8.8.8:53",
@@ -24,5 +27,6 @@
   ],
   "record_type": "txt",
   "pubkey": "",
+  "psk": "",
   "log_level": "info"
 }

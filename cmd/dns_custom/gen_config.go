@@ -28,8 +28,11 @@ func runGenSystemd(args []string) {
   "listen": %q,
   "target": %q,
   "allow_targets": [],
-  "max_sessions": 0,
+  "max_sessions": 256,
+  "psks": [],
+  "query_rate_per_source": 50,
   "edns0": false,
+  "marker": "",
   "domain": %q,
   "privkey": %q,
   "log_level": "info"

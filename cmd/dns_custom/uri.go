@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -62,10 +61,14 @@ func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin strin
 		NoisePublicKey:   rawPub,
 	}
 	profJSON, _ := json.Marshal(prof)
+	// A failed encryption is a hard error, not a downgrade: the fallback to a
+	// plaintext stun:// would silently ship the profile (domain, resolvers,
+	// pubkey) to whoever scans the QR code, and an encryption failure usually
+	// means something is wrong with the environment. Fail loudly instead.
 	stunURI, usedPin, err := encryptStunURI(profJSON, pin)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to encrypt share URI (%v); falling back to plaintext stun://.\n", err)
-		stunURI = "stun://" + base64.StdEncoding.EncodeToString(profJSON)
+		fmt.Fprintf(os.Stderr, "Error: failed to encrypt share URI: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 2. Direct Protocol URI (plaintext, for non-Stun clients)

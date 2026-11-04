@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +30,13 @@ var zlog *zap.SugaredLogger = zap.NewNop().Sugar()
 // traffic before the client tears it down.
 const udpClientPeerIdle = 5 * time.Minute
 
+// maxUDPPeers bounds how many distinct local peers may hold tunnel sessions at
+// once. Every source address that sends one datagram would otherwise open a
+// full tunnel session (Noise handshake included); without a cap a spoofed or
+// merely busy network turns the local listener into an unbounded session
+// generator against this process AND the server's MaxSessions.
+const maxUDPPeers = 512
+
 type Config struct {
 	Mode         string   `json:"mode"`          // "server" or "client"
 	Listen       string   `json:"listen"`        // Server listen address (e.g. ":53") or client listen address (e.g. "127.0.0.1:1080")
@@ -38,10 +46,18 @@ type Config struct {
 	PubKey       string   `json:"pubkey"`        // Client server public key (Hex / Base64)
 	AllowTargets []string `json:"allow_targets"` // Server only: patterns granting client-declared targets (e.g. "tcp://127.0.0.1:*"); empty = default target only
 	MaxSessions  int      `json:"max_sessions"`  // Server only: concurrent session cap (0 = unlimited)
-	EDNS0        bool     `json:"edns0"`         // Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)
-	Servers      []string `json:"-"`             // Parsed upstream DNS servers
-	RecordType   string   `json:"record_type"`   // DNS record type: txt, null, cname, a, aaaa, mx, srv, ns
-	LogLevel     string   `json:"log_level"`     // debug, info, warn, error
+	// PSKs turns on server-side client authentication: each session's capability
+	// probe must carry a valid HMAC proof derived from one of these secrets.
+	PSKs []string `json:"psks"` // Server only; empty = anonymous clients allowed
+	// QueryRatePerSource caps queries per second from a single source IP
+	// (token bucket, burst = rate). 0 = unlimited.
+	QueryRatePerSource int      `json:"query_rate_per_source"` // Server only
+	EDNS0              bool     `json:"edns0"`                 // Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)
+	Marker             string   `json:"marker"`                // Tunnel marker label; BOTH ends must agree. Empty = built-in "tunnel2"
+	PSK                string   `json:"psk"`                   // Client only: pre-shared secret for PSK-authenticated servers
+	Servers            []string `json:"-"`                     // Parsed upstream DNS servers
+	RecordType         string   `json:"record_type"`           // DNS record type: txt, null, cname, a, aaaa, mx, srv, ns
+	LogLevel           string   `json:"log_level"`             // debug, info, warn, error
 	// ExchangeTimeout caps how long one DNS exchange waits for its reply; a lost
 	// query costs that much wall clock before retransmit. 0 = default.
 	ExchangeTimeout time.Duration `json:"exchange_timeout,omitempty"`
@@ -145,6 +161,25 @@ func applyEnvOverrides(cfg *Config) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MaxSessions = n
 		}
+	}
+	if v := getEnv("DNSCUSTOM_PSKS", "PSKS"); v != "" {
+		cfg.PSKs = nil
+		for _, s := range strings.Split(v, ",") {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				cfg.PSKs = append(cfg.PSKs, trimmed)
+			}
+		}
+	}
+	if v := getEnv("DNSCUSTOM_QUERY_RATE_PER_SOURCE", "QUERY_RATE_PER_SOURCE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.QueryRatePerSource = n
+		}
+	}
+	if v := getEnv("DNSCUSTOM_MARKER", "MARKER"); v != "" {
+		cfg.Marker = strings.TrimSpace(v)
+	}
+	if v := getEnv("DNSCUSTOM_PSK", "PSK"); v != "" {
+		cfg.PSK = strings.TrimSpace(v)
 	}
 	if v := getEnv("DNSCUSTOM_EDNS0", "EDNS0"); v != "" {
 		switch strings.ToLower(v) {
@@ -377,14 +412,17 @@ func runGenURI(args []string) {
 
 func buildServerConfig(cfg *Config) dnstunnel.ServerConfig {
 	sc := dnstunnel.ServerConfig{
-		ListenAddr:   cfg.Listen,
-		TargetAddr:   cfg.Target,
-		Domain:       cfg.Domain,
-		PrivateKey:   cfg.PrivKey,
-		AllowTargets: cfg.AllowTargets,
-		MaxSessions:  cfg.MaxSessions,
-		EDNS0:        cfg.EDNS0,
-		Logger:       zlog,
+		ListenAddr:         cfg.Listen,
+		TargetAddr:         cfg.Target,
+		Domain:             cfg.Domain,
+		PrivateKey:         cfg.PrivKey,
+		AllowTargets:       cfg.AllowTargets,
+		MaxSessions:        cfg.MaxSessions,
+		EDNS0:              cfg.EDNS0,
+		Logger:             zlog,
+		PSKs:               cfg.PSKs,
+		QueryRatePerSource: cfg.QueryRatePerSource,
+		Marker:             cfg.Marker,
 	}
 	if sc.ListenAddr == "" {
 		sc.ListenAddr = ":53"
@@ -406,6 +444,8 @@ func buildClientConfig(cfg *Config) dnstunnel.ClientConfig {
 		Logger:          zlog,
 		ExchangeTimeout: cfg.ExchangeTimeout,
 		PollInterval:    cfg.PollInterval,
+		Marker:          cfg.Marker,
+		PSK:             cfg.PSK,
 	}
 	if cc.RecordType == "" {
 		cc.RecordType = "txt"
@@ -594,6 +634,7 @@ func runUDPForwardClient(ctx context.Context, cli *dnstunnel.Client, listen stri
 
 	var mu sync.Mutex
 	peers := make(map[string]*udpPeer)
+	var dropped atomic.Int64
 	dropPeer := func(key string, peer *udpPeer) {
 		mu.Lock()
 		if peers[key] == peer {
@@ -650,6 +691,18 @@ func runUDPForwardClient(ctx context.Context, cli *dnstunnel.Client, listen stri
 		mu.Unlock()
 
 		if !ok {
+			// Peer cap: refuse to open new sessions once the table is full. The
+			// drop is logged sparsely (every 1000th plus the first) so a flood
+			// cannot become a log flood either.
+			mu.Lock()
+			full := len(peers) >= maxUDPPeers
+			mu.Unlock()
+			if full {
+				if n := dropped.Add(1); n == 1 || n%1000 == 0 {
+					zlog.Warnf("peer limit reached (%d); dropping datagram from %s until an idle peer is reaped", maxUDPPeers, key)
+				}
+				continue
+			}
 			stream, derr := cli.DialUDP(ctx)
 			if derr != nil {
 				zlog.Errorf("Failed to establish UDP tunnel for %s: %v", key, derr)
