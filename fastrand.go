@@ -2,6 +2,7 @@ package dnstunnel
 
 import (
 	crand "crypto/rand"
+	"encoding/binary"
 	mrand "math/rand/v2"
 	"sync"
 )
@@ -30,10 +31,12 @@ var fastRandPool = sync.Pool{New: func() any {
 		// crypto/rand does not fail on modern platforms. This fallback only
 		// weakens anti-spoofing (Noise keys are derived separately and never
 		// touch this), so degrade quietly instead of panicking a hot path.
-		seed = [32]byte{0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15,
-			0x2d, 0x8e, 0x91, 0x3b, 0x56, 0xc4, 0x0f, 0xa7,
-			0x1c, 0x64, 0xd8, 0x35, 0xeb, 0x02, 0x9a, 0x47,
-			0x70, 0xbe, 0x13, 0x5f, 0xc9, 0x26, 0x8d, 0xf1}
+		// The math/rand/v2 global source is seeded from runtime entropy at
+		// startup, which is still far better than a fixed constant an attacker
+		// could simply read out of this file.
+		for i := 0; i < len(seed)/8; i++ {
+			binary.LittleEndian.PutUint64(seed[i*8:], mrand.Uint64())
+		}
 	}
 	return mrand.NewChaCha8(seed)
 }}

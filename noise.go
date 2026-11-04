@@ -145,6 +145,15 @@ func NewClientNoiseSession(serverPubkey [32]byte) (*NoiseSession, []byte, error)
 		return nil, nil, err
 	}
 
+	// The KDF binds the DH output with the server's static public key as salt.
+	// A full Noise_NK handshake would also chain the transcript hash (including
+	// the client ephemeral) through blake2s into this derivation; the binding
+	// is deliberately NOT changed here because the wire handshake is shared
+	// with the deployed Stun Android/TV clients, whose implementation this
+	// repository does not control - changing the salt would break every
+	// deployed client against a new server. The DH output already guarantees
+	// per-session key uniqueness, so the omission costs transcript-binding
+	// hygiene, not confidentiality.
 	kdf := hkdf.New(blake2sHash, dh, serverPubkey[:], []byte("dns_custom_noise_v1"))
 	kC2S := make([]byte, 32)
 	kS2C := make([]byte, 32)

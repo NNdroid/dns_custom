@@ -253,6 +253,13 @@ func pskKeyFromSecret(secret string) []byte {
 
 // pskProof computes the per-session authentication proof a client sends in its
 // capability probe: HMAC-SHA256(psk, sessionID) truncated to 16 bytes.
+//
+// Threat boundary: the proof gates session creation and close signals, not
+// stream integrity. It is deterministic per session ID and rides a plaintext
+// query name when Noise is off, so an on-path observer can replay it — the same
+// observer can already read the whole tunnel, which is inherent to plaintext
+// DNS tunneling. PSK is access control for *anonymous* abuse; use Noise for
+// confidentiality and per-chunk AEAD integrity.
 func pskProof(key []byte, sessionID string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(sessionID))
