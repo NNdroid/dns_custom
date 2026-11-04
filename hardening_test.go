@@ -197,7 +197,7 @@ func TestCloseQueryIsAuthenticatedOnNoiseServers(t *testing.T) {
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("forged close answered rcode %d, want NXDOMAIN", resp.Rcode)
 	}
-	if _, alive := srv.handler.sessions[sessionID]; !alive {
+	if !sessionAlive(srv, sessionID) {
 		t.Fatal("forged close killed a Noise session")
 	}
 
@@ -260,7 +260,7 @@ func TestCloseQueryOnPSKServersRequiresProof(t *testing.T) {
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("proofless close answered rcode %d, want NXDOMAIN", resp.Rcode)
 	}
-	if _, alive := srv.handler.sessions[sessionID]; !alive {
+	if !sessionAlive(srv, sessionID) {
 		t.Fatal("proofless close killed a PSK-authenticated session")
 	}
 
@@ -273,6 +273,16 @@ func TestCloseQueryOnPSKServersRequiresProof(t *testing.T) {
 	}
 }
 
+// sessionAlive reads the server's session table under its lock: ServeDNS runs
+// on its own goroutines and mutates the map, so even a test-side peek races
+// without it.
+func sessionAlive(srv *Server, sessionID string) bool {
+	srv.handler.mu.RLock()
+	defer srv.handler.mu.RUnlock()
+	_, alive := srv.handler.sessions[sessionID]
+	return alive
+}
+
 // waitForSessionGone polls the server's session table until the session
 // disappears (the close signal travels on a detached goroutine) or the budget
 // runs out.
@@ -280,10 +290,7 @@ func waitForSessionGone(t *testing.T, srv *Server, sessionID string) bool {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		srv.handler.mu.RLock()
-		_, alive := srv.handler.sessions[sessionID]
-		srv.handler.mu.RUnlock()
-		if !alive {
+		if !sessionAlive(srv, sessionID) {
 			return true
 		}
 		time.Sleep(50 * time.Millisecond)
