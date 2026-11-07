@@ -683,6 +683,16 @@ type DNSClientTunnel struct {
 	caseCheckDisabled atomic.Bool
 	caseFailStreak    atomic.Int32
 
+	// Protocol v3 capability state, established during the dial sequence:
+	// optPayload = every upstream path verified that it forwards the tunnel
+	// EDNS0 option, so upstream DATA payloads ride the option in binary
+	// (~11x the QNAME budget); serverCaps = capability bits from the target
+	// declaration's response; optCanaryOK = per-path canary results, written
+	// before the pollers start and read-only afterwards.
+	optPayload  bool
+	serverCaps  byte
+	optCanaryOK []bool
+
 	// pollKick nudges idle pollers as soon as an upstream write completes, so the
 	// server's fresh downstream data is fetched within one RTT instead of after
 	// up to a full poll interval.
@@ -802,6 +812,9 @@ func newDNSClientTunnel(ctx context.Context, p clientTunnelParams) (*DNSClientTu
 		paths:           paths,
 		window:          dnsTunnelUpstreamWindow,
 	}
+	if p.edns0 {
+		t.optCanaryOK = make([]bool, len(paths))
+	}
 
 	if p.pubKey != "" {
 		if qtype == dns.TypeA || qtype == dns.TypeAAAA {
@@ -855,6 +868,13 @@ func newDNSClientTunnel(ctx context.Context, p clientTunnelParams) (*DNSClientTu
 	// pollers per path overlap their round trips to multiply the fetch rate; their
 	// idle interval is doubled so an idle tunnel does not triple its query load.
 	t.inCond = sync.NewCond(&t.inMu)
+
+	// v3: canary every upstream path for tunnel-OPT forwarding before the
+	// pollers start, so every query of the session uses one consistent chunk
+	// size. An all-paths pass lets upstream DATA chunks ride the EDNS0 option
+	// in binary - roughly 11x the QNAME payload budget - while a single
+	// OPT-stripping path keeps the whole session on the QNAME.
+	t.verifyOptPayload()
 
 	for i := range t.servers {
 		for k := 0; k < dnsTunnelPollersPerPath; k++ {
@@ -926,11 +946,23 @@ func (t *DNSClientTunnel) edns0Effective() bool {
 // and wire payload. The query sequence doubles as the DNS transaction ID. With
 // EDNS0 enabled the query announces a 1232-byte buffer so resolvers forward the
 // server's larger answers instead of truncating them at 512.
+//
+// When the session verified OPT payload transport on every path
+// (t.optPayload), a DATA payload rides the tunnel EDNS0 option in binary and
+// the QNAME carries no payload labels at all: binary option data holds ~11x
+// the QNAME's base32 budget. Every other flag (and any fallback) keeps the
+// payload in the QNAME.
 func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
+	qnamePayload := wirePayload
+	optPayload := []byte(nil)
+	if flag == flagData && t.optPayload && len(wirePayload) > 0 {
+		qnamePayload = nil
+		optPayload = wirePayload
+	}
 	seq := atomic.AddUint32(&t.seq, 1)
 	// Build and 0x20-randomize in one mutable buffer so the hot path pays
 	// for only one final []byte -> string conversion.
-	name := buildQueryNameRandomized(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, wirePayload)
+	name := buildQueryNameRandomized(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, qnamePayload)
 
 	m := new(dns.Msg)
 	m.SetQuestion(name, t.qtype)
@@ -945,6 +977,13 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 	m.Id = binary.BigEndian.Uint16(idBuf[:])
 	if t.edns0 {
 		m.SetEdns0(dnsTunnelEDNS0UDPSize, false)
+		if len(optPayload) > 0 {
+			edns := m.IsEdns0()
+			edns.Option = append(edns.Option, &dns.EDNS0_LOCAL{
+				Code: ednsOptionTunnelPayload,
+				Data: optPayload,
+			})
+		}
 	}
 	return m
 }
@@ -1983,10 +2022,44 @@ func (t *DNSClientTunnel) sendCloseSignal() {
 	_, _ = path.exchange(ctx, m)
 }
 
+// declarePayload builds the T-query payload for one declaration: the PSK proof
+// prefix when configured, then the encrypted (or plaintext) declaration body.
+func (t *DNSClientTunnel) declarePayload(addr string, wantUDP bool) []byte {
+	payload := encodeTargetRequest(addr, wantUDP)
+	if t.pskKey != nil {
+		// Client authentication: the probe carries HMAC-SHA256(psk, sessionID)
+		// so PSK servers can bind the session to a secret-holder. The proof is
+		// placed in front of the declaration; the server strips and verifies it.
+		payload = append(pskProof(t.pskKey, t.session), payload...)
+	}
+	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
+		payload = t.noiseSession.SendCipher.Encrypt(uint64(dnsTunnelControlSeq), payload)
+	}
+	return payload
+}
+
+// attachOptCanary appends the v3 capability canary ([magic][nonce]) to a T
+// query's EDNS0 option and returns the nonce the server must mirror back in
+// the reply's optEcho byte - matching it proves the resolver path forwards
+// unknown EDNS0 options unharmed.
+func (t *DNSClientTunnel) attachOptCanary(m *dns.Msg, padded bool) byte {
+	var nonce [1]byte
+	fastRandBytes(nonce[:])
+	m.SetEdns0(dnsTunnelEDNS0UDPSize, false)
+	edns := m.IsEdns0()
+	edns.Option = append(edns.Option, &dns.EDNS0_LOCAL{
+		Code: ednsOptionTunnelPayload,
+		Data: optTunnelCanary(nonce[0], padded),
+	})
+	return nonce[0]
+}
+
 // declareTarget sends a flag 'T' query declaring the backend this session wants
 // ("" = the server default) and returns the transport the server confirmed:
 // "tcp" or "udp". The declaration is encrypted with the reserved control
-// sequence when Noise is on, and the answer is always plaintext.
+// sequence when Noise is on, and the answer is always plaintext. With EDNS0 on,
+// every T query carries the OPT canary and the reply's optEcho marks the path
+// that answered as canary-verified.
 func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 	addr, wantUDP := "", false
 	if target != "" {
@@ -2001,16 +2074,7 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 		}
 		addr, wantUDP = host, network == "udp"
 	}
-	payload := encodeTargetRequest(addr, wantUDP)
-	if t.pskKey != nil {
-		// Client authentication: the probe carries HMAC-SHA256(psk, sessionID)
-		// so PSK servers can bind the session to a secret-holder. The proof is
-		// placed in front of the declaration; the server strips and verifies it.
-		payload = append(pskProof(t.pskKey, t.session), payload...)
-	}
-	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
-		payload = t.noiseSession.SendCipher.Encrypt(uint64(dnsTunnelControlSeq), payload)
-	}
+	payload := t.declarePayload(addr, wantUDP)
 
 	// Multiple attempts ensure the server has a chance to answer even if some
 	// queries are lost. A slow Noise handshake is retried across attempts.
@@ -2047,10 +2111,15 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 		if err == nil && resp != nil {
 			for _, ans := range resp.Answer {
 				if raw := extractAnswer(ans); raw != nil {
-					status, udp, ok := decodeTargetResponse(raw)
+					status, udp, caps, _, ok := decodeTargetResponse(raw)
 					if !ok {
 						continue
 					}
+					// The dedicated verification probe (verifyOptPayload) decides
+					// per-path capability with a padded canary; the declaration
+					// exchange only carries a small one so a 512-byte-limited
+					// resolver path cannot break the dial.
+					t.serverCaps = caps
 					if status == targetStatusDeny {
 						if t.events != nil {
 							t.events.publish(ClientEvent{
@@ -2100,9 +2169,79 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 // that fits the DNS QNAME safety budget. Old servers that do not answer the
 // capability/target probe never call this method, preserving the historical
 // conservative 32-byte (22-byte with Noise) fallback.
+// verifyOptPayload canaries every upstream path that the target-declaration
+// exchange did not already verify (the exchange canaries the path that
+// answered it as a side effect). The session enables binary OPT payloads only
+// when EVERY path forwarded the canary: chunks are routed across all paths
+// uniformly, so a single OPT-stripping resolver would corrupt every large
+// chunk routed through it. Anonymous sessions stay in QNAME mode - the server
+// ignores OPT payloads from them, matching the big-pipe response policy.
+func (t *DNSClientTunnel) verifyOptPayload() {
+	if !t.edns0 || t.optCanaryOK == nil {
+		return
+	}
+	if t.noiseSession == nil && t.pskKey == nil {
+		return
+	}
+	var wg sync.WaitGroup
+	for i := range t.paths {
+		if t.optCanaryOK[i] {
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer t.guardGoroutine("opt canary")
+			t.optCanaryOK[i] = t.optCanaryOnePath(i)
+		}(i)
+	}
+	wg.Wait()
+	for _, ok := range t.optCanaryOK {
+		if !ok {
+			t.log.Debugf("session %s: OPT canary failed on a path; upstream stays in QNAME mode", t.session)
+			return
+		}
+	}
+	t.optPayload = true
+	// The declaration exchange sized chunks for the QNAME budget; re-run now
+	// that the OPT budget applies.
+	t.setChunkSize()
+}
+
+// optCanaryOnePath sends one T query carrying the OPT canary and reports
+// whether the answer mirrored the nonce back.
+func (t *DNSClientTunnel) optCanaryOnePath(idx int) bool {
+	msg := t.buildQuery(dnsTunnelControlSeq, flagTarget, t.declarePayload("", false))
+	nonce := t.attachOptCanary(msg, true)
+	resp, err := t.paths[idx].exchange(t.ctx, msg)
+	if err != nil || resp == nil {
+		return false
+	}
+	for _, ans := range resp.Answer {
+		if raw := extractAnswer(ans); raw != nil {
+			if _, _, _, optEcho, ok := decodeTargetResponse(raw); ok && optEcho == nonce {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// setChunkSize expands upstream DATA chunks to the largest payload that fits
+// the transport: the QNAME budget in QNAME mode, or the EDNS0 option budget
+// once every path verified OPT forwarding (with the AEAD tag deducted, since
+// the wire payload is the ciphertext).
 func (t *DNSClientTunnel) setChunkSize() {
 	noise := t.noiseSession != nil && t.noiseSession.SendCipher != nil
-	chunk := maxUpstreamPlainChunk(t.domain, t.marker, t.session, noise)
+	chunk := 0
+	if t.optPayload {
+		chunk = maxUpstreamOptChunk(t.domain, t.marker, t.session)
+		if noise {
+			chunk -= noiseTagSize
+		}
+	} else {
+		chunk = maxUpstreamPlainChunk(t.domain, t.marker, t.session, noise)
+	}
 	if chunk <= 0 {
 		t.log.Warnf("Domain/marker too long for expanded multi-label queries; staying on conservative chunk size")
 		return

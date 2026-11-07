@@ -165,6 +165,11 @@ func (s *Server) Run(ctx context.Context) error {
 		Handler:      s.handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
+		// miekg defaults the UDP read buffer to 512 bytes, which would drop
+		// every EDNS0-sized QUERY before parsing (the response side already
+		// sized its buffers via dnsTunnelEDNS0UDPSize). v3 clients carry
+		// upstream payloads in the tunnel option, pushing queries past 512.
+		UDPSize: dnsTunnelEDNS0UDPSize,
 	}
 
 	tcpServer := &dns.Server{
@@ -1252,6 +1257,12 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		_ = w.WriteMsg(reply)
 		return
 	}
+	// v3: an authenticated session may carry its upstream DATA payload in the
+	// tunnel EDNS0 option (binary, ~11x the QNAME budget). Anonymous sessions
+	// stay on the QNAME payload, matching the legacy response-budget policy.
+	if flag == flagData && len(data) == 0 && sess.authenticated() {
+		data = optTunnelData(req)
+	}
 	if sess.isClosed() && flag != flagPoll && flag != flagClose {
 		// A dead backend cannot accept more upstream bytes. Returning NXDOMAIN
 		// lets the client distinguish session loss from a temporary DNS path
@@ -1447,7 +1458,17 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 
 	reply.SetReply(req)
 	reply.Authoritative = true
-	if rr := makeAnswer(q.Name, q.Qtype, encodeTargetResponse(status, udp), s.domain); rr != nil {
+	// v3 capability advertisement plus the canary echo: a query whose OPT
+	// option carried [magic][nonce] gets the nonce mirrored back, which is
+	// what lets the client verify this resolver path forwards unknown EDNS0
+	// options and NULL rdata unharmed. Pre-v3 clients read only the first
+	// two bytes and ignore the rest.
+	caps := byte(capOptPayload)
+	optEcho := byte(0)
+	if canary := optTunnelData(req); len(canary) >= 2 && canary[0] == optCanaryMagic {
+		optEcho = canary[1]
+	}
+	if rr := makeAnswer(q.Name, q.Qtype, encodeTargetResponse(status, udp, caps, optEcho), s.domain); rr != nil {
 		reply.Answer = append(reply.Answer, rr)
 	}
 	_ = w.WriteMsg(reply)

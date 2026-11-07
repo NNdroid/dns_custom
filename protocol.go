@@ -773,14 +773,79 @@ func extractAnswer(rr dns.RR) []byte {
 //	                                 Encrypted with the reserved control sequence
 //	                                 when Noise is on (the backend address is the
 //	                                 sensitive part), plaintext otherwise.
-//	response [status:1][udpMarker:1] Always plaintext and 2 bytes so it fits every
-//	                                 record type, A/AAAA included: it leaks nothing
-//	                                 but the transport.
+//	                                 When EDNS0 is enabled the query also carries
+//	                                 the tunnel OPT option (below) with a canary
+//	                                 payload, so the reply doubles as the
+//	                                 per-path capability probe.
+//	response [status:1][udp:1][caps:1][optEcho:1]
+//	                                 status/udp as before. caps advertises
+//	                                 protocol-v3 capabilities (capOptPayload,
+//	                                 capReliableNULL); optEcho mirrors the
+//	                                 canary byte the query's OPT option
+//	                                 carried, 0 when absent - matching it
+//	                                 proves the resolver path forwards unknown
+//	                                 EDNS0 options and NULL rdata unharmed.
+//	                                 Pre-v3 servers answer only the first two
+//	                                 bytes; older clients read exactly those
+//	                                 and ignore the rest.
 const (
 	targetFlagUDP    = 1
 	targetStatusOK   = 0
 	targetStatusDeny = 1
 )
+
+// ednsOptionTunnelPayload is the private-use EDNS0 option code (RFC 6891
+// reserves 65001-65534) that carries an upstream DATA payload in binary when
+// both ends and every resolver path verified it: the 253-character QNAME
+// budget and base32's 60% overhead are what cap upstream throughput, and a
+// 1232-byte EDNS0 query fits ~1 KiB of option data instead of ~90 bytes of
+// QNAME payload.
+const ednsOptionTunnelPayload = 65001
+
+// caps bit flags carried in the target-declaration response.
+const (
+	// capOptPayload: the server accepts an upstream DATA payload in the
+	// tunnel EDNS0 option for authenticated sessions.
+	capOptPayload = 1 << iota
+	// capReliableNULL: the server serves NULL answers through the same
+	// reliable window as TXT ([serverSeq][skipTo] frames), so a session may
+	// upgrade to binary NULL rdata without losing stream reliability.
+	capReliableNULL
+)
+
+// optCanaryMagic is the first byte of the OPT canary a v3 client attaches to
+// every T query; optCanaryNonce is the random second byte the server mirrors
+// back in optEcho.
+const (
+	optCanaryMagic = 0x4E
+)
+
+// dnsTunnelMaxOptChunk caps one OPT-carried upstream chunk. ~1 KiB leaves
+// margin inside a 1232-byte query for the header, question, OPT RR and
+// sequence-number growth.
+const dnsTunnelMaxOptChunk = 1024
+
+// maxUpstreamOptChunk returns the largest payload one DATA query may carry in
+// the tunnel EDNS0 option: the 1232-byte query budget minus header, question
+// (which keeps session/seq/ack/flag/dataSeq/marker/domain), the OPT RR itself
+// and a growth margin.
+func maxUpstreamOptChunk(domain, marker, session string) int {
+	domain = dns.Fqdn(domain)
+	if marker == "" {
+		marker = dnsTunnelMarker
+	}
+	// header(12) + question(name+2+4) + OPT RR(1 + 2 + 2 + 4 + 2 + rdata) so
+	// 11 fixed bytes, plus 16 for decimal growth of the sequence fields.
+	fixed := 12 + len(domain) + len(session) + 1 + 10 + 1 + 10 + 1 + 1 + 1 + 10 + 1 + len(marker) + 1 + 11 + 16
+	room := dnsTunnelEDNS0UDPSize - fixed
+	if room < 0 {
+		return 0
+	}
+	if room > dnsTunnelMaxOptChunk {
+		room = dnsTunnelMaxOptChunk
+	}
+	return room
+}
 
 func encodeTargetRequest(addr string, udp bool) []byte {
 	marker := byte(0)
@@ -797,19 +862,58 @@ func decodeTargetRequest(payload []byte) (addr string, udp bool, ok bool) {
 	return string(payload[1:]), payload[0] == targetFlagUDP, true
 }
 
-func encodeTargetResponse(status byte, udp bool) []byte {
+func encodeTargetResponse(status byte, udp bool, caps byte, optEcho byte) []byte {
 	marker := byte(0)
 	if udp {
 		marker = targetFlagUDP
 	}
-	return []byte{status, marker}
+	return []byte{status, marker, caps, optEcho}
 }
 
-func decodeTargetResponse(payload []byte) (status byte, udp bool, ok bool) {
+// decodeTargetResponse parses the target-declaration reply. Pre-v3 servers
+// answer only [status][udp]; caps and optEcho default to 0 (no capabilities
+// advertised, no canary echo) for such replies.
+func decodeTargetResponse(payload []byte) (status byte, udp bool, caps byte, optEcho byte, ok bool) {
 	if len(payload) < 2 {
-		return 0, false, false
+		return 0, false, 0, 0, false
 	}
-	return payload[0], payload[1] == targetFlagUDP, true
+	if len(payload) >= 4 {
+		return payload[0], payload[1] == targetFlagUDP, payload[2], payload[3], true
+	}
+	return payload[0], payload[1] == targetFlagUDP, 0, 0, true
+}
+
+// optCanaryPaddingSize pads the dedicated per-path canary query: passing it
+// proves not only that the resolver forwards unknown EDNS0 options but that
+// it accepts >512-byte queries at all - without that, every data query would
+// be silently dropped and the session would die in a retransmit storm.
+const optCanaryPaddingSize = 900
+
+// optTunnelCanary builds the canary payload a v3 client attaches to T queries:
+// [magic][nonce] plus padding on the dedicated verification probe. The server
+// mirrors the nonce back in optEcho, which is what lets the client verify a
+// resolver path forwards unknown EDNS0 options and large queries unharmed.
+func optTunnelCanary(nonce byte, padded bool) []byte {
+	data := []byte{optCanaryMagic, nonce}
+	if padded {
+		data = append(data, make([]byte, optCanaryPaddingSize)...)
+	}
+	return data
+}
+
+// optTunnelData extracts the upstream DATA payload a v3 client carried in the
+// tunnel EDNS0 option, nil when absent.
+func optTunnelData(req *dns.Msg) []byte {
+	opt := req.IsEdns0()
+	if opt == nil {
+		return nil
+	}
+	for _, o := range opt.Option {
+		if e, ok := o.(*dns.EDNS0_LOCAL); ok && e.Code == ednsOptionTunnelPayload {
+			return e.Data
+		}
+	}
+	return nil
 }
 
 // matchTargetPattern reports whether a requested target matches one allow-list
