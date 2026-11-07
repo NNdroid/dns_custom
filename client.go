@@ -1070,17 +1070,35 @@ func (t *DNSClientTunnel) downstreamWindow() uint32 {
 	return uint32(w)
 }
 
+// upstreamWindowCeiling caps the in-flight window. The window exists to fill
+// the pipe (bandwidth × RTT), so it is bounded in bytes - window × chunkSize -
+// not only in count: a count cap that is right for ~90-byte Noise chunks
+// starves kilobyte ones, and one that fits kilobyte chunks floods the resolver
+// with the small ones. The per-path and total count caps remain as
+// resolver-load guards beneath the byte bound.
+func (t *DNSClientTunnel) upstreamWindowCeiling() int {
+	ceil := dnsTunnelMaxTotalWindow
+	if byPath := dnsTunnelMaxUpstreamWindow * len(t.paths); ceil > byPath {
+		ceil = byPath
+	}
+	if t.chunkSize > 0 {
+		if byBytes := dnsTunnelMaxWindowBytes / t.chunkSize; ceil > byBytes {
+			ceil = byBytes
+		}
+	}
+	if ceil < dnsTunnelMinUpstreamWindow {
+		ceil = dnsTunnelMinUpstreamWindow
+	}
+	return ceil
+}
+
 // upstreamWindow is how many upstream chunks may be in flight at once. It starts
 // conservatively and is grown by onWindowSample, and its ceiling scales with the
 // number of paths: every configured path carries its own share of the load, so more
 // paths justify more in-flight queries - but only the measurements can say how many.
 func (t *DNSClientTunnel) upstreamWindow() int {
 	w := int(atomic.LoadInt32(&t.window))
-	max := dnsTunnelMaxUpstreamWindow * len(t.paths)
-	if max > dnsTunnelMaxTotalWindow {
-		max = dnsTunnelMaxTotalWindow
-	}
-	if w > max {
+	if max := t.upstreamWindowCeiling(); w > max {
 		w = max
 	}
 	if w < dnsTunnelMinUpstreamWindow {
@@ -1217,21 +1235,27 @@ func (t *DNSClientTunnel) onWindowSample(ok bool, rtt time.Duration) {
 
 // growWindow applies the additive-increase step, paced to roughly one step per
 // round trip: a window's worth of successful queries is about one RTT at the
-// current concurrency.
+// current concurrency. The step itself scales with the current window
+// (cur/8, floored at 1): a strict +1 needs ~w RTTs to reach a window of w,
+// which on the raised ceiling turned the ramp into tens of seconds of
+// under-utilized link. cur/8 per window's worth of samples doubles the
+// window roughly every 8 RTTs while the measured backoff stays in charge of
+// convergence.
 func (t *DNSClientTunnel) growWindow() {
 	if t.winCredit.Add(1) < int64(atomic.LoadInt32(&t.window)) {
 		return
 	}
 	t.winCredit.Store(0)
 	t.resizeWindow(func(cur int32) int32 {
-		ceil := dnsTunnelMaxUpstreamWindow * len(t.paths)
-		if ceil > dnsTunnelMaxTotalWindow {
-			ceil = dnsTunnelMaxTotalWindow
+		ceil := int32(t.upstreamWindowCeiling())
+		step := cur / 8
+		if step < 1 {
+			step = 1
 		}
-		if cur+1 > int32(ceil) {
-			return int32(ceil)
+		if cur+step > ceil {
+			return ceil
 		}
-		return cur + 1
+		return cur + step
 	})
 }
 

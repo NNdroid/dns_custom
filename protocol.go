@@ -84,13 +84,18 @@ const (
 	// universally correct value. Measured on a loopback link 8 is already the peak
 	// (more in flight makes every query slower and throughput falls), while on a 20 ms
 	// path 16 nearly doubles throughput. The window therefore adapts from the RTT of
-	// the queries themselves instead of being hardcoded.
-	dnsTunnelUpstreamWindow    = 12 // per path, initial
-	dnsTunnelMinUpstreamWindow = 4  // per path
-	dnsTunnelMaxUpstreamWindow = 16
-	// dnsTunnelMaxTotalWindow caps the window across every path, so a long server list
-	// cannot turn into an unbounded query flood.
-	dnsTunnelMaxTotalWindow = 64
+	// the queries themselves instead of being hardcoded. The ceiling is additionally
+	// bounded in bytes (dnsTunnelMaxWindowBytes): window × chunkSize is what fills the
+	// pipe, and a pure count cap that suits 90-byte Noise chunks would flood the
+	// resolver with kilobyte chunks - or starve them.
+	dnsTunnelUpstreamWindow    = 12  // per path, initial
+	dnsTunnelMinUpstreamWindow = 4   // per path
+	dnsTunnelMaxUpstreamWindow = 32  // per path
+	dnsTunnelMaxTotalWindow    = 256 // across all paths
+	// dnsTunnelMaxWindowBytes caps window × chunkSize per session. With legacy
+	// ~90-byte chunks this never binds (count caps bind first); with kilobyte
+	// chunks (EDNS0 OPT payload mode) it is the resolver-load guard.
+	dnsTunnelMaxWindowBytes = 256 << 10
 	// dnsTunnelWindowWarmup is how many leading upstream samples the congestion
 	// signals ignore, so cold-start latency is never mistaken for the path's best
 	// RTT. The window itself still ramps during warmup — only the best-RTT
