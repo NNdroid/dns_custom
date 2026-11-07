@@ -328,7 +328,7 @@ func rrWireCost(nameLen int) int {
 // past the client's 1232-byte read buffer: each iteration re-claimed the
 // FULL message budget while earlier RRs' rdata was still in it.
 func maxAnswerRdata(nameLen, extraRRs int, qtype uint16, udpBudget, spentRdata int) int {
-	budget := udpBudget - 12 - (nameLen+2) - 4 - (extraRRs+1)*rrWireCost(nameLen) - spentRdata
+	budget := udpBudget - 12 - (nameLen + 2) - 4 - (extraRRs+1)*rrWireCost(nameLen) - spentRdata
 	if budget <= 0 {
 		return 0
 	}
