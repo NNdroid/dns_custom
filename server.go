@@ -609,7 +609,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		if noise && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 			return nil
 		}
-		if chunk := s.popServerNow(maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, 0), noise); chunk != nil {
+		if chunk := s.popServerNow(maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, 0, 0), noise); chunk != nil {
 			return [][]byte{chunk}
 		}
 		return nil
@@ -654,8 +654,11 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 	// whole datagram. Each packed RR also pays rrWireCost for its own qname
 	// echo.
 	var out [][]byte
+	// spentRdata tracks the encoded rdata already claimed by this reply's
+	// packed RRs - the wire budget each further RR may claim shrinks by it.
+	spentRdata := 0
 	for s.serverBuf.Len() > 0 && len(s.serverOut) < window {
-		maxPayload := maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, len(out))
+		maxPayload := maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, len(out), spentRdata)
 		if maxPayload <= 0 || s.serverOutBytes+maxPayload+noiseTagSize > dnsTunnelRetransmitBytes {
 			break
 		}
@@ -673,6 +676,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		s.serverOutBytes += len(ct)
 		s.serverOutOrder = append(s.serverOutOrder, seq)
 		out = append(out, encodeDownstreamFrame(seq, s.serverSkipTo, ct))
+		spentRdata += encodedRdataSize(len(ct), qtype)
 	}
 
 	if hadPending && len(s.serverOut) > 0 {
@@ -684,7 +688,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		// short poll queries retransmit it.
 		oldest := s.serverOutOrder[0]
 		frame := encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
-		if fitDownstreamPayloadBudget(qnameLen, len(frame), qtype, udpBudget-len(out)*rrWireCost(qnameLen)) >= len(frame) {
+		if fitDownstreamPayloadBudget(qnameLen, len(frame), qtype, udpBudget-len(out)*rrWireCost(qnameLen)-spentRdata) >= len(frame) {
 			out = append(out, frame)
 		}
 	}

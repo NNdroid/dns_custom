@@ -23,17 +23,19 @@ func TestTCPCapScalesWithinRetransmitBudget(t *testing.T) {
 	}
 }
 
-// TestDownstreamPackingServesMultipleChunksPerPoll pins T2: one reply packs
-// several downstream chunks as separate answer RRs, so a poll drains more than
-// the single-chunk cap per round trip.
+// TestDownstreamPackingServesMultipleChunksPerPoll pins T2 where it pays:
+// over TCP the 64 KiB reply budget holds more than one 32 KiB chunk, so a
+// poll drains the remainder in the same reply. On UDP/EDNS0 the fit-shrink
+// already consumes nearly the whole budget with one chunk - there the reply
+// stays single-RR, which is asserted too so the accounting stays honest.
 func TestDownstreamPackingServesMultipleChunksPerPoll(t *testing.T) {
 	s := newDnsSession("packtest0123456", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
-	if !s.pushServer(bytes.Repeat([]byte{0x61}, 2048)) {
+	if !s.pushServer(bytes.Repeat([]byte{0x61}, 48000)) {
 		t.Fatal("pushServer rejected payload")
 	}
-	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize)
+	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelTCPResponseSize)
 	if len(chunks) < 2 {
-		t.Fatalf("packing served %d chunks per poll, want >= 2", len(chunks))
+		t.Fatalf("packing served %d chunks per TCP poll, want >= 2", len(chunks))
 	}
 	total := 0
 	for _, c := range chunks {
@@ -43,10 +45,30 @@ func TestDownstreamPackingServesMultipleChunksPerPoll(t *testing.T) {
 		}
 		total += len(payload)
 	}
-	// Single-chunk service caps one poll at ~663 bytes; packing must beat it.
-	if total <= 800 {
-		t.Fatalf("packed reply carried only %d bytes, want well above the single-chunk cap", total)
+	// The reply budget bounds one poll: more than the 32 KiB single-chunk
+	// cap, but not the whole backlog - the rest waits for the next poll.
+	if total < 40000 || total > 48000 {
+		t.Fatalf("packed reply carried %d bytes, want between the 32KiB cap and the backlog", total)
 	}
+
+	// UDP/EDNS0: one fit-sized chunk consumes the reply budget; the packer
+	// must not overflow it with a second RR.
+	u := newDnsSession("packtest0123457", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	if !u.pushServer(bytes.Repeat([]byte{0x61}, 48000)) {
+		t.Fatal("pushServer rejected payload")
+	}
+	uchunks := u.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize)
+	if len(uchunks) != 1 {
+		t.Fatalf("EDNS0 poll served %d chunks, want 1 (fit-shrink fills the budget)", len(uchunks))
+	}
+	sentRRs := 0
+	for _, c := range uchunks {
+		if encodedRdataSize(len(c), dns.TypeTXT) > dnsTunnelEDNS0UDPSize-136 {
+			t.Fatalf("packed reply rdata %d exceeds the single-RR EDNS0 budget", encodedRdataSize(len(c), dns.TypeTXT))
+		}
+		sentRRs++
+	}
+	_ = sentRRs
 }
 
 // TestDownstreamPackingCarriesRetransmitAlongsideFresh pins the loss-path win:
@@ -54,9 +76,8 @@ func TestDownstreamPackingServesMultipleChunksPerPoll(t *testing.T) {
 // retransmission in the same reply instead of spending a round trip on it.
 func TestDownstreamPackingCarriesRetransmitAlongsideFresh(t *testing.T) {
 	s := newDnsSession("packtest0123457", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
-	// A small first batch keeps the un-acked chunk small enough that it fits a
-	// reply alongside fresh data (a full-size ~650-byte chunk consumes nearly
-	// the whole EDNS0 budget on its own).
+	// Over TCP the reply budget leaves room for the retransmission after the
+	// fresh chunk; over EDNS0 a single chunk consumes it all.
 	if !s.pushServer(bytes.Repeat([]byte{0x62}, 400)) {
 		t.Fatal("pushServer rejected payload")
 	}
@@ -67,7 +88,7 @@ func TestDownstreamPackingCarriesRetransmitAlongsideFresh(t *testing.T) {
 	if !s.pushServer([]byte("more-data")) {
 		t.Fatal("pushServer rejected payload")
 	}
-	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize)
+	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelTCPResponseSize)
 	if len(chunks) < 2 {
 		t.Fatalf("retransmit was not packed alongside fresh data: %d chunks", len(chunks))
 	}

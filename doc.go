@@ -52,12 +52,25 @@
 // # Throughput paths
 //
 // Downstream throughput is bounded by the response budget of the upstream
-// transport: ~200-byte chunks under the legacy 512-byte UDP limit, ~800-byte
-// chunks with EDNS0 ("edns0" on both ends), and ~8 KiB chunks when queries
+// transport: ~200-byte chunks under the legacy 512-byte UDP limit, ~660-byte
+// chunks with EDNS0 ("edns0" on both ends), and ~32 KiB chunks when queries
 // arrive over TCP (tcp:// upstreams or resolvers forwarding over TCP — DNS/TCP
-// messages are length-prefixed and not datagram-bound). Upstream pollers (three
-// per path, additive in-flight windows on both directions) pipeline the round
-// trips; clients advertise their downstream flow-control window in every poll.
+// messages are length-prefixed and not datagram-bound). One reply packs
+// several downstream chunks as separate answer RRs whenever the budget and
+// the client's advertised flow-control window have room, so a poll drains
+// more than one chunk per round trip and retransmissions ride alongside fresh
+// data under loss.
+//
+// Upstream payloads ride the QNAME (~90-106 bytes per query after base32) —
+// or, when "edns0" is on and every upstream path verified tunnel-OPT
+// forwarding (a padded capability canary runs once per dial), in a
+// private-use EDNS0 option as binary: ~1 KiB per query, roughly 11x. TXT
+// sessions whose paths also canary NULL forwarding intact upgrade to binary
+// NULL rdata (~21% more downstream payload) served through the same reliable
+// window; disable_null_upgrade keeps the configured record type. Upstream
+// pollers (three per path, additive in-flight windows bounded in bytes on
+// both directions) pipeline the round trips; clients advertise their
+// downstream flow-control window in every poll.
 //
 // # Client-declared targets
 //

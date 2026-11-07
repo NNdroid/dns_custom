@@ -319,12 +319,16 @@ func rrWireCost(nameLen int) int {
 }
 
 // maxAnswerRdata returns the largest rdata that fits one answer RR in a
-// message that already carries `extraRRs` answer RRs, each echoing the same
-// qname. It is fitDownstreamPayloadBudget generalized to packed replies (see
-// serveDownstream): extraRRs == 0 reproduces the single-RR budget exactly.
-// Every RR pays its own qname echo, including this one - hence extraRRs + 1.
-func maxAnswerRdata(nameLen, extraRRs int, qtype uint16, udpBudget int) int {
-	budget := udpBudget - 12 - (nameLen + 2) - 4 - (extraRRs+1)*rrWireCost(nameLen)
+// message that already carries `extraRRs` answer RRs (each echoing the same
+// qname) and `spentRdata` bytes of rdata claimed by earlier RRs. It is
+// fitDownstreamPayloadBudget generalized to packed replies (see
+// serveDownstream): extraRRs == 0 and spentRdata == 0 reproduce the single-RR
+// budget exactly. Every RR pays its own qname echo, including this one -
+// hence extraRRs + 1. Omitting spentRdata is what overflowed packed replies
+// past the client's 1232-byte read buffer: each iteration re-claimed the
+// FULL message budget while earlier RRs' rdata was still in it.
+func maxAnswerRdata(nameLen, extraRRs int, qtype uint16, udpBudget, spentRdata int) int {
+	budget := udpBudget - 12 - (nameLen+2) - 4 - (extraRRs+1)*rrWireCost(nameLen) - spentRdata
 	if budget <= 0 {
 		return 0
 	}
@@ -346,13 +350,13 @@ func maxAnswerRdata(nameLen, extraRRs int, qtype uint16, udpBudget int) int {
 // record type capacity, minus the framing overhead the receiver has to see, shrunk
 // until the whole response fits on the wire.
 func maxDownstreamPayload(qtype uint16, noise bool, nameLen int) int {
-	return maxDownstreamPayloadBudget(qtype, noise, nameLen, dnsTunnelMaxUDPResponse, 0)
+	return maxDownstreamPayloadBudget(qtype, noise, nameLen, dnsTunnelMaxUDPResponse, 0, 0)
 }
 
 // maxDownstreamPayloadBudget sizes one fresh downstream chunk as the extraRRs-th
 // answer RR of a packed reply. Stored chunks that do not fit a later query
 // remain queued until a query with enough space arrives.
-func maxDownstreamPayloadBudget(qtype uint16, noise bool, nameLen int, udpBudget int, extraRRs int) int {
+func maxDownstreamPayloadBudget(qtype uint16, noise bool, nameLen int, udpBudget int, extraRRs, spentRdata int) int {
 	capacity := downstreamCapBudget(qtype, noise, udpBudget)
 	// Size fresh chunks for this response. Stored chunks that do not fit a
 	// later query remain queued until a query with enough space arrives.
@@ -369,7 +373,7 @@ func maxDownstreamPayloadBudget(qtype uint16, noise bool, nameLen int, udpBudget
 			overhead = nonTxtNoiseHeaderSize + noiseTagSize
 		}
 	}
-	avail := maxAnswerRdata(nameLen, extraRRs, qtype, udpBudget) - overhead
+	avail := maxAnswerRdata(nameLen, extraRRs, qtype, udpBudget, spentRdata) - overhead
 	if avail > capacity {
 		avail = capacity
 	}
