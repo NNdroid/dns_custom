@@ -329,8 +329,11 @@ func TestDownstreamAnswerFitsUDP(t *testing.T) {
 	}
 }
 
-// BenchmarkTunnelThroughput* measures end-to-end throughput over one vs. several
-// upstream paths. Run with: go test -run '^$' -bench 'TunnelThroughput' -benchtime 5x
+// BenchmarkTunnelThroughput* measures steady-state end-to-end throughput over
+// one vs. several upstream paths: one session is established up front and the
+// window ramp is warmed up before the timer starts, so the numbers reflect
+// transfer speed, not dial churn. Run with: go test -run '^$' -bench
+// 'TunnelThroughput' -benchtime 5x
 func benchmarkTunnelThroughput(b *testing.B, paths int) { benchmarkTunnelBench(b, paths, false) }
 
 func benchmarkTunnelThroughputEDNS(b *testing.B, paths int) { benchmarkTunnelBench(b, paths, true) }
@@ -372,10 +375,81 @@ func benchmarkTunnelBench(b *testing.B, paths int, edns bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	tunnel, err := newTestTunnelSession(ctx, servers, domain, "", edns, nil)
+	if err != nil {
+		b.Fatalf("NewDNSClientTunnel failed: %v", err)
+	}
+	defer tunnel.Close()
+
+	// Warm-up: the adaptive window and RTT estimate need a few round trips to
+	// ramp; without this the benchmark measures cold-start churn instead of
+	// throughput and every mode converges on the same dial-dominated number.
+	for i := 0; i < 3; i++ {
+		if _, err := tunnel.Write(payload); err != nil {
+			b.Fatalf("warmup write failed: %v", err)
+		}
+		if _, err := io.ReadFull(tunnel, recv); err != nil {
+			b.Fatalf("warmup read failed: %v", err)
+		}
+	}
+
 	b.SetBytes(size)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		tunnel, err := newTestTunnelSession(ctx, servers, domain, "", edns, nil)
+		if _, err := tunnel.Write(payload); err != nil {
+			b.Fatalf("write failed: %v", err)
+		}
+		if _, err := io.ReadFull(tunnel, recv); err != nil {
+			b.Fatalf("read failed: %v", err)
+		}
+		if !bytes.Equal(recv, payload) {
+			b.Fatalf("payload corrupted on round %d", i)
+		}
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(tunnel.upstreamWindow()), "window")
+}
+
+// BenchmarkTunnelThroughputColdStart keeps the historical per-iteration
+// session churn (dial + handshake + window warmup + close inside every round)
+// so cold-start cost stays visible: it is what interactive one-shot sessions
+// actually pay, and it is the number the old benchmark accidentally reported.
+func BenchmarkTunnelThroughputColdStart(b *testing.B) {
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("echo listen failed: %v", err)
+	}
+	defer echoLn.Close()
+	go func() {
+		for {
+			conn, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(conn)
+		}
+	}()
+
+	domain := "tunnel.bench.local"
+	srv, err := NewDNSServer(ServerConfig{Domain: domain, TargetAddr: echoLn.Addr().String()})
+	if err != nil {
+		b.Fatal(err)
+	}
+	dnsAddr := startTestDNSServer(b, srv)
+
+	const size = 65536
+	payload := make([]byte, size)
+	recv := make([]byte, size)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b.SetBytes(size)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tunnel, err := newTestTunnelSession(ctx, []string{dnsAddr}, domain, "", false, nil)
 		if err != nil {
 			b.Fatalf("NewDNSClientTunnel failed: %v", err)
 		}
@@ -387,9 +461,6 @@ func benchmarkTunnelBench(b *testing.B, paths int, edns bool) {
 		}
 		if !bytes.Equal(recv, payload) {
 			b.Fatalf("payload corrupted on round %d", i)
-		}
-		if i == 0 {
-			b.ReportMetric(float64(tunnel.upstreamWindow()), "window")
 		}
 		_ = tunnel.Close()
 	}
