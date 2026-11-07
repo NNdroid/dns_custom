@@ -7,6 +7,22 @@ import (
 	"github.com/miekg/dns"
 )
 
+// TestTCPCapScalesWithinRetransmitBudget pins the T1 relationship: the TCP
+// chunk cap must leave a workable in-flight count inside the retransmission
+// byte cap, or the byte cap - not the window - silently clamps TCP-mode
+// throughput.
+func TestTCPCapScalesWithinRetransmitBudget(t *testing.T) {
+	if got := downstreamCapBudget(dns.TypeNULL, false, dnsTunnelTCPResponseSize); got != dnsTunnelTCPMaxServerChunk {
+		t.Fatalf("TCP NULL chunk cap = %d, want %d", got, dnsTunnelTCPMaxServerChunk)
+	}
+	if got := downstreamCapBudget(dns.TypeTXT, false, dnsTunnelTCPResponseSize); got != dnsTunnelTCPMaxServerChunk {
+		t.Fatalf("TCP TXT chunk cap = %d, want %d", got, dnsTunnelTCPMaxServerChunk)
+	}
+	if inFlight := dnsTunnelRetransmitBytes / dnsTunnelTCPMaxServerChunk; inFlight < 64 {
+		t.Fatalf("retransmit budget holds only %d TCP chunks; want >= 64 in flight", inFlight)
+	}
+}
+
 func TestLongDataQNameDoesNotPoisonLaterPoll(t *testing.T) {
 	s := newDnsSession("0123456789abcdef", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	payload := bytes.Repeat([]byte{0x5a}, 96)

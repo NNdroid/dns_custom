@@ -39,8 +39,11 @@ const dnsTunnelUpstreamOOOBytes = 1 << 20
 
 // dnsTunnelRetransmitBytes bounds the downstream retransmission buffer per
 // session in bytes. The advertised window bounds the chunk COUNT, but with
-// 8 KiB TCP chunks count alone would allow one session to pin megabytes here.
-const dnsTunnelRetransmitBytes = 1 << 20
+// 32 KiB TCP chunks count alone would let one session pin hundreds of
+// megabytes here. 4 MiB holds ~128 in-flight 32 KiB chunks - the same count
+// the old 1 MiB cap allowed at 8 KiB chunks - so TCP-mode throughput scales
+// with the chunk size without the memory bound growing per chunk.
+const dnsTunnelRetransmitBytes = 4 << 20
 
 // ServerConfig configures a Server. Logger may be left nil for a silent server;
 // the CLI injects its own zap logger here.

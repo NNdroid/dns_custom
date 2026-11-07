@@ -49,9 +49,12 @@ const (
 	// Queries arriving over TCP are length-prefixed (16-bit) and not bound by
 	// any UDP datagram limit, so their response budget follows the transport.
 	// The chunk cap stays far below the 64 KiB message ceiling to keep the
-	// per-session retransmission buffer (window × chunk) bounded.
+	// per-session retransmission buffer (window × chunk) bounded by
+	// dnsTunnelRetransmitBytes: 32 KiB chunks × the advertised window is what
+	// sets TCP-mode throughput, and the byte cap - not this count cap - is the
+	// real memory bound (4 MiB ≈ 128 in-flight chunks).
 	dnsTunnelTCPResponseSize   = 64 * 1024
-	dnsTunnelTCPMaxServerChunk = 8192
+	dnsTunnelTCPMaxServerChunk = 32768
 	dnsTunnelCloseTimeout      = 2 * time.Second
 	dnsTunnelMarker            = "tunnel2"
 	// dnsTunnelDownstreamWindow bounds how many downstream chunks may be
