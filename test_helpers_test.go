@@ -15,6 +15,15 @@ func parseQueryName(domain, name string) (session string, querySeq, ack, dataSeq
 	return parseQueryNameForMarkers(domain, len(dns.SplitDomainName(domain)), name, markerSetFor(""))
 }
 
+// firstChunk returns the first packed chunk of a serveDownstream reply, for
+// tests that exercise single-chunk behavior.
+func firstChunk(chunks [][]byte) []byte {
+	if len(chunks) == 0 {
+		return nil
+	}
+	return chunks[0]
+}
+
 // newTestTunnel opens a tunnel session with the defaults the test matrix uses
 // (TXT record type, no Noise, silent logger). Knobs beyond that stay opt-in:
 // pass tunnel options, or build clientTunnelParams directly for exotic cases.

@@ -23,6 +23,62 @@ func TestTCPCapScalesWithinRetransmitBudget(t *testing.T) {
 	}
 }
 
+// TestDownstreamPackingServesMultipleChunksPerPoll pins T2: one reply packs
+// several downstream chunks as separate answer RRs, so a poll drains more than
+// the single-chunk cap per round trip.
+func TestDownstreamPackingServesMultipleChunksPerPoll(t *testing.T) {
+	s := newDnsSession("packtest0123456", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	if !s.pushServer(bytes.Repeat([]byte{0x61}, 2048)) {
+		t.Fatal("pushServer rejected payload")
+	}
+	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize)
+	if len(chunks) < 2 {
+		t.Fatalf("packing served %d chunks per poll, want >= 2", len(chunks))
+	}
+	total := 0
+	for _, c := range chunks {
+		_, _, payload, ok := decodeDownstreamFrame(c)
+		if !ok || len(payload) == 0 {
+			t.Fatalf("packed chunk did not decode: ok=%v len=%d", ok, len(c))
+		}
+		total += len(payload)
+	}
+	// Single-chunk service caps one poll at ~663 bytes; packing must beat it.
+	if total <= 800 {
+		t.Fatalf("packed reply carried only %d bytes, want well above the single-chunk cap", total)
+	}
+}
+
+// TestDownstreamPackingCarriesRetransmitAlongsideFresh pins the loss-path win:
+// with window room left, a poll returns fresh chunks AND the oldest un-acked
+// retransmission in the same reply instead of spending a round trip on it.
+func TestDownstreamPackingCarriesRetransmitAlongsideFresh(t *testing.T) {
+	s := newDnsSession("packtest0123457", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
+	// A small first batch keeps the un-acked chunk small enough that it fits a
+	// reply alongside fresh data (a full-size ~650-byte chunk consumes nearly
+	// the whole EDNS0 budget on its own).
+	if !s.pushServer(bytes.Repeat([]byte{0x62}, 400)) {
+		t.Fatal("pushServer rejected payload")
+	}
+	if got := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize); len(got) == 0 {
+		t.Fatal("first serve produced nothing")
+	}
+	// No ack arrived: the first batch is un-acked but the window has room.
+	if !s.pushServer([]byte("more-data")) {
+		t.Fatal("pushServer rejected payload")
+	}
+	chunks := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelEDNS0UDPSize)
+	if len(chunks) < 2 {
+		t.Fatalf("retransmit was not packed alongside fresh data: %d chunks", len(chunks))
+	}
+	// Fresh data is packed first; the oldest un-acked chunk rides at the end.
+	last := chunks[len(chunks)-1]
+	first, _, _, ok := decodeDownstreamFrame(last)
+	if !ok || first != 1 {
+		t.Fatalf("oldest un-acked chunk must ride the reply: got seq=%d ok=%v", first, ok)
+	}
+}
+
 func TestLongDataQNameDoesNotPoisonLaterPoll(t *testing.T) {
 	s := newDnsSession("0123456789abcdef", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
 	payload := bytes.Repeat([]byte{0x5a}, 96)
@@ -40,7 +96,7 @@ func TestLongDataQNameDoesNotPoisonLaterPoll(t *testing.T) {
 		t.Fatalf("long QNAME consumed server data: have=%d want=%d", s.serverBuf.Len(), len(payload))
 	}
 
-	got := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	got := firstChunk(s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse))
 	if len(got) == 0 {
 		t.Fatal("short poll QNAME could not fetch downstream data after long DATA QNAME")
 	}
@@ -53,7 +109,7 @@ func TestOversizedRetransmitWaitsForShortPoll(t *testing.T) {
 		t.Fatal("pushServer rejected payload")
 	}
 
-	first := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	first := firstChunk(s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse))
 	if len(first) == 0 {
 		t.Fatal("short poll did not create first downstream chunk")
 	}
@@ -70,7 +126,7 @@ func TestOversizedRetransmitWaitsForShortPoll(t *testing.T) {
 		t.Fatal("long QNAME incorrectly discarded retransmit state")
 	}
 
-	retry := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	retry := firstChunk(s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse))
 	if len(retry) == 0 {
 		t.Fatal("short poll could not retransmit queued downstream chunk")
 	}
@@ -91,7 +147,7 @@ func TestEncryptedRetransmitPreservesChunkAcrossQNameBudgets(t *testing.T) {
 	if !s.pushServer(payload) {
 		t.Fatal("pushServer rejected payload")
 	}
-	first := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	first := firstChunk(s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse))
 	seq, _, encrypted, ok := decodeDownstreamFrame(first)
 	if !ok {
 		t.Fatal("short poll did not create a framed chunk")
@@ -106,7 +162,7 @@ func TestEncryptedRetransmitPreservesChunkAcrossQNameBudgets(t *testing.T) {
 			t.Fatal("long QNAME emitted oversized encrypted retransmit")
 		}
 	}
-	retry := s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse)
+	retry := firstChunk(s.serveDownstream(dns.TypeTXT, 70, dnsTunnelMaxUDPResponse))
 	if !bytes.Equal(first, retry) || s.serverOutBytes != queuedBytes || len(s.serverOut) != 1 {
 		t.Fatal("deferring retransmit changed ciphertext or retransmission state")
 	}

@@ -124,14 +124,14 @@ func TestServerDownstreamRetransmitThenGiveUp(t *testing.T) {
 	sess.serverBuf.WriteString("AAAA")
 
 	// First serve: seq=1, retained in serverOut pending the client's ACK.
-	first := sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse)
+	first := firstChunk(sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse))
 	s1, skip1, p1, ok := decodeDownstreamFrame(first)
 	if !ok || s1 != 1 || skip1 != 0 || string(p1) != "AAAA" {
 		t.Fatalf("first frame mismatch: seq=%d skipTo=%d payload=%q ok=%v", s1, skip1, p1, ok)
 	}
 
 	// Still unacked: the same chunk must be retransmitted.
-	again := sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse)
+	again := firstChunk(sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse))
 	s2, skip2, p2, _ := decodeDownstreamFrame(again)
 	if s2 != 1 || skip2 != 0 || string(p2) != "AAAA" {
 		t.Fatalf("expected retransmit of seq 1, got seq=%d skipTo=%d payload=%q", s2, skip2, p2)
@@ -141,7 +141,7 @@ func TestServerDownstreamRetransmitThenGiveUp(t *testing.T) {
 	sess.serverOut[1].firstSent = time.Now().Add(-dnsTunnelDownstreamGiveUp - time.Second)
 	sess.serverBuf.WriteString("BBBB")
 
-	third := sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse)
+	third := firstChunk(sess.serveDownstream(dns.TypeTXT, len(testPollQName), dnsTunnelMaxUDPResponse))
 	s3, skip3, p3, _ := decodeDownstreamFrame(third)
 	if s3 != 2 || skip3 != 2 || string(p3) != "BBBB" {
 		t.Fatalf("after give-up expected seq=2 skipTo=2 payload=%q, got seq=%d skipTo=%d payload=%q", "BBBB", s3, skip3, p3)

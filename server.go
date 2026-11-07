@@ -562,22 +562,30 @@ func (s *dnsSession) sealDownstream(seq uint32, payload []byte) []byte {
 	return payload
 }
 
-// serveDownstream returns the next downstream chunk for the client.
+// serveDownstream returns the downstream chunks to pack into one reply.
 // For TXT it implements the reliable-ordered transport as a sliding window: while
-// fewer than dnsTunnelDownstreamWindow chunks are outstanding it serves fresh data,
+// fewer than the advertised window chunks are outstanding it serves fresh data,
 // so concurrent polls across multiple upstream servers each fetch a different chunk
 // and their throughput adds up. Once the window is full it falls back to
 // retransmitting the oldest un-acked chunk.
 //
+// One reply packs several chunks (each as its own answer RR): the wire budget
+// that used to leave a single oversized chunk plus slack now fills with
+// additional fresh chunks, and under loss the oldest retransmission rides
+// alongside fresh data instead of costing its own round trip. The client
+// reassembly is order-independent and already iterates every answer RR, so
+// this is server-side only and wire-compatible with older clients. Every extra
+// RR pays the echoed qname (rrWireCost), which is what bounds the packing.
+//
 // Other record types use the legacy best-effort path (popServerNow), which has no
-// retransmission and therefore no window, but is now chunked to the capacity of the
+// retransmission and therefore no window, but is chunked to the capacity of the
 // record type instead of a fixed 32 bytes.
 //
 // A chunk that stays unacked past dnsTunnelDownstreamGiveUp is abandoned: it is
 // dropped from serverOut and serverSkipTo tells the client to expect the next seq.
 // Accepting a gap is what stops one repeatedly-dropped response from stalling the
 // entire stream forever.
-func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) []byte {
+func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) [][]byte {
 	noise := s.noiseSession != nil && s.noiseSession.SendCipher != nil
 	if qtype != dns.TypeTXT {
 		// A/AAAA answers hold exactly one address, which cannot carry a framed,
@@ -586,7 +594,10 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		if noise && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 			return nil
 		}
-		return s.popServerNow(maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget), noise)
+		if chunk := s.popServerNow(maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, 0), noise); chunk != nil {
+			return [][]byte{chunk}
+		}
+		return nil
 	}
 
 	s.mu.Lock()
@@ -611,49 +622,58 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		s.serverSkipTo = oldest + 1
 	}
 
-	// Window has room and there is fresh data: hand the poll a new chunk. Each
-	// concurrent poll takes a distinct chunk because serverOut grows under s.mu.
+	// hadPending records whether any un-acked chunk existed before this reply:
+	// serverOutOrder is FIFO, so if it did, its front is a pre-existing chunk
+	// eligible for retransmission below - and if it did not, everything in
+	// serverOut afterwards was created by this very reply and must not ride
+	// its own retransmission.
+	hadPending := len(s.serverOut) > 0
+
+	// Pack fresh chunks while the window, the retransmission byte budget and
+	// the reply budget all have room. Each concurrent poll takes distinct
+	// chunks because serverOut grows under s.mu.
 	//
-	// The chunk is sized against the response budget: a data query echoes the
-	// upstream chunk label in the answer, so it can carry less downstream data than
-	// a poll can, and overshooting the negotiated UDP size loses the whole datagram.
-	// The retransmission buffer is additionally bounded in bytes: with 8 KiB TCP
-	// chunks even the advertised window could otherwise balloon one session's
-	// memory far past what MaxSessions promised.
-	maxPayload := maxDownstreamPayloadBudget(dns.TypeTXT, noise, qnameLen, udpBudget)
-	if maxPayload > 0 && len(s.serverOut) < window &&
-		s.serverOutBytes+maxPayload+noiseTagSize <= dnsTunnelRetransmitBytes &&
-		s.serverBuf.Len() > 0 {
+	// Chunks are sized against the response budget: a data query echoes the
+	// upstream chunk label in the answer, so it can carry less downstream data
+	// than a poll can, and overshooting the negotiated UDP size loses the
+	// whole datagram. Each packed RR also pays rrWireCost for its own qname
+	// echo.
+	var out [][]byte
+	for s.serverBuf.Len() > 0 && len(s.serverOut) < window {
+		maxPayload := maxDownstreamPayloadBudget(dns.TypeTXT, noise, qnameLen, udpBudget, len(out))
+		if maxPayload <= 0 || s.serverOutBytes+maxPayload+noiseTagSize > dnsTunnelRetransmitBytes {
+			break
+		}
 		avail := maxPayload
 		if s.serverBuf.Len() < avail {
 			avail = s.serverBuf.Len()
 		}
-		out := make([]byte, avail)
-		_, _ = s.serverBuf.Read(out)
+		payload := make([]byte, avail)
+		_, _ = s.serverBuf.Read(payload)
 		s.serverCond.Signal()
 		seq := s.serverNext
 		s.serverNext++
-		ct := s.sealDownstream(seq, out)
+		ct := s.sealDownstream(seq, payload)
 		s.serverOut[seq] = &downstreamChunk{ct: ct, firstSent: time.Now()}
 		s.serverOutBytes += len(ct)
 		s.serverOutOrder = append(s.serverOutOrder, seq)
-		return encodeDownstreamFrame(seq, s.serverSkipTo, ct)
+		out = append(out, encodeDownstreamFrame(seq, s.serverSkipTo, ct))
 	}
 
-	if len(s.serverOut) > 0 {
-		// Window full (or nothing fresh to send): refill the oldest gap. The frame
-		// is rebuilt each time so retransmissions carry the current skipTo.
-		// A chunk created for a short POLL query may not fit a later long DATA
-		// query. Do not truncate or discard it: return an empty response here and
-		// let one of the client's short poll queries retransmit it.
+	if hadPending && len(s.serverOut) > 0 {
+		// Pack the oldest un-acked chunk alongside the fresh data (or alone
+		// when there is nothing fresh). The frame is rebuilt each time so
+		// retransmissions carry the current skipTo. A chunk created for a
+		// short POLL query may not fit a later long DATA query: skip it here
+		// rather than truncate or discard it, and let one of the client's
+		// short poll queries retransmit it.
 		oldest := s.serverOutOrder[0]
 		frame := encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
-		if fitDownstreamPayloadBudget(qnameLen, len(frame), dns.TypeTXT, udpBudget) < len(frame) {
-			return nil
+		if fitDownstreamPayloadBudget(qnameLen, len(frame), dns.TypeTXT, udpBudget-len(out)*rrWireCost(qnameLen)) >= len(frame) {
+			out = append(out, frame)
 		}
-		return frame
 	}
-	return nil
+	return out
 }
 
 // popServerNow serves one best-effort chunk for non-TXT record types, chunked to the
@@ -1318,10 +1338,14 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		udpBudget = dnsTunnelMaxUDPResponse
 	}
 
-	downstreamData := sess.serveDownstream(q.Qtype, len(q.Name), udpBudget)
-	if len(downstreamData) > 0 {
-		rr := makeAnswer(q.Name, q.Qtype, downstreamData, s.domain)
-		if rr != nil {
+	// One reply may pack several downstream chunks (each its own answer RR, see
+	// serveDownstream); makeAnswer sizes each RR against the same chunk budget
+	// the packing used, so the message stays inside udpBudget.
+	for _, chunk := range sess.serveDownstream(q.Qtype, len(q.Name), udpBudget) {
+		if len(chunk) == 0 {
+			continue
+		}
+		if rr := makeAnswer(q.Name, q.Qtype, chunk, s.domain); rr != nil {
 			reply.Answer = append(reply.Answer, rr)
 		}
 	}
