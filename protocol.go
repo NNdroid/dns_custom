@@ -169,6 +169,15 @@ var queryNameBufferPool = sync.Pool{New: func() any {
 	return &buf
 }}
 
+// queryDecodeSrcPool holds the scratch buffer that assembles a query's base32
+// payload labels (lowercased) before decoding on the server's hot path. Only
+// the transient encoded form is pooled: the decoded payload is returned to the
+// caller and outlives the buffer.
+var queryDecodeSrcPool = sync.Pool{New: func() any {
+	buf := make([]byte, 0, 512)
+	return &buf
+}}
+
 func dnsTypeToQType(t string) (uint16, error) {
 	switch strings.ToLower(strings.TrimSpace(t)) {
 	case "", "txt":
@@ -541,14 +550,31 @@ func parseQueryNameV2(labels []string, markerIndex int, name string) (session st
 	}
 	dataSeq = uint32(ds)
 	if markerIndex > 5 {
-		var sb strings.Builder
+		// Hot path: assemble the payload labels lowercased into a pooled
+		// scratch buffer and decode into one exact-size output. The old
+		// strings.Builder + per-label ToLower + DecodeString chain cost ~10
+		// of the 13 allocations every server-side parse paid.
+		srcPooled := queryDecodeSrcPool.Get().(*[]byte)
+		src := (*srcPooled)[:0]
 		for _, l := range labels[5:markerIndex] {
-			sb.WriteString(strings.ToLower(l))
+			for i := 0; i < len(l); i++ {
+				c := l[i]
+				if c >= 'A' && c <= 'Z' {
+					c |= 0x20
+				}
+				src = append(src, c)
+			}
 		}
-		data, err = dnsTunnelB32.DecodeString(sb.String())
+		dst := make([]byte, dnsTunnelB32.DecodedLen(len(src)))
+		n, err := dnsTunnelB32.Decode(dst, src)
+		if cap(src) <= 4096 {
+			*srcPooled = src[:0]
+			queryDecodeSrcPool.Put(srcPooled)
+		}
 		if err != nil {
 			return "", 0, 0, 0, 0, nil, fmt.Errorf("bad payload in %q: %w", name, err)
 		}
+		data = dst[:n]
 	}
 	return session, querySeq, ack, dataSeq, flag, data, nil
 }

@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -96,21 +97,35 @@ func newNoiseCipherState(key []byte) (*NoiseCipherState, error) {
 	return &NoiseCipherState{aead: aead}, nil
 }
 
-func noiseNonce(seq uint64) []byte {
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[4:], seq)
-	return nonce[:]
+// noiseNoncePool reuses the 12-byte nonce buffers. The nonce has to live in a
+// heap cell because Seal/Open are reached through the cipher.AEAD interface,
+// which defeats escape analysis; a pool beats one small allocation per message
+// on both data paths. Seal/Open are synchronous and never retain the nonce, so
+// the buffer can be recycled as soon as they return.
+var noiseNoncePool = sync.Pool{New: func() any { return new([12]byte) }}
+
+// noiseNonce writes the 12-byte AEAD nonce derived from seq into buf.
+func noiseNonce(buf *[12]byte, seq uint64) {
+	binary.LittleEndian.PutUint64(buf[4:], seq)
 }
 
 // Encrypt seals plaintext under the nonce derived from seq. Same seq + same
 // plaintext always yields the same ciphertext, so retransmissions are byte-identical.
 func (s *NoiseCipherState) Encrypt(seq uint64, plaintext []byte) []byte {
-	return s.aead.Seal(nil, noiseNonce(seq), plaintext, nil)
+	n := noiseNoncePool.Get().(*[12]byte)
+	noiseNonce(n, seq)
+	ct := s.aead.Seal(nil, n[:], plaintext, nil)
+	noiseNoncePool.Put(n)
+	return ct
 }
 
 // Decrypt opens ciphertext using the nonce derived from seq.
 func (s *NoiseCipherState) Decrypt(seq uint64, ciphertext []byte) ([]byte, error) {
-	return s.aead.Open(nil, noiseNonce(seq), ciphertext, nil)
+	n := noiseNoncePool.Get().(*[12]byte)
+	noiseNonce(n, seq)
+	plain, err := s.aead.Open(nil, n[:], ciphertext, nil)
+	noiseNoncePool.Put(n)
+	return plain, err
 }
 
 // NoiseSession manages bidirectional encrypted channel derived from Noise_NK handshake
