@@ -297,11 +297,18 @@ type dnsSession struct {
 	server         *DNSServer                    // for event publishing; set at creation
 	events         *eventDispatcher[ServerEvent] // session events (shared with the server)
 	pskAuthed      bool                          // client proved PSK knowledge via its capability probe
-	tcpConn        net.Conn
-	udpConn        net.Conn
-	noiseSession   *NoiseSession
-	clientBuf      *bytes.Buffer
-	serverBuf      *bytes.Buffer
+	// reliableNULL records that the session's capability exchange carried a
+	// v3 canary, so NULL queries from this session expect the same framed,
+	// windowed downstream transport as TXT. Legacy clients never send the
+	// canary and keep the best-effort NULL path. Set before any data query of
+	// a v3 session (the capability exchange precedes the pollers), read-only
+	// afterwards.
+	reliableNULL bool
+	tcpConn      net.Conn
+	udpConn      net.Conn
+	noiseSession *NoiseSession
+	clientBuf    *bytes.Buffer
+	serverBuf    *bytes.Buffer
 	// frameBuf is reused by the single framed-datagram pump goroutine to hold one
 	// upstream datagram. Allocating up to 64 KiB per datagram was the largest
 	// per-packet allocation in datagram mode.
@@ -568,7 +575,8 @@ func (s *dnsSession) sealDownstream(seq uint32, payload []byte) []byte {
 }
 
 // serveDownstream returns the downstream chunks to pack into one reply.
-// For TXT it implements the reliable-ordered transport as a sliding window: while
+// For TXT - and for NULL once the session verified protocol-v3 capability -
+// it implements the reliable-ordered transport as a sliding window: while
 // fewer than the advertised window chunks are outstanding it serves fresh data,
 // so concurrent polls across multiple upstream servers each fetch a different chunk
 // and their throughput adds up. Once the window is full it falls back to
@@ -584,7 +592,9 @@ func (s *dnsSession) sealDownstream(seq uint32, payload []byte) []byte {
 //
 // Other record types use the legacy best-effort path (popServerNow), which has no
 // retransmission and therefore no window, but is chunked to the capacity of the
-// record type instead of a fixed 32 bytes.
+// record type instead of a fixed 32 bytes. A/AAAA answers hold exactly one
+// address and cannot carry a framed payload at all: serve nothing rather than
+// ship a truncated ciphertext the client can only reject.
 //
 // A chunk that stays unacked past dnsTunnelDownstreamGiveUp is abandoned: it is
 // dropped from serverOut and serverSkipTo tells the client to expect the next seq.
@@ -592,10 +602,10 @@ func (s *dnsSession) sealDownstream(seq uint32, payload []byte) []byte {
 // entire stream forever.
 func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) [][]byte {
 	noise := s.noiseSession != nil && s.noiseSession.SendCipher != nil
-	if qtype != dns.TypeTXT {
-		// A/AAAA answers hold exactly one address, which cannot carry a framed,
-		// authenticated payload. Serve nothing rather than ship a truncated
-		// ciphertext the client can only reject.
+	// NULL rides the reliable window once the session's capability exchange
+	// proved a v3 client: binary rdata with frames beats base32 TXT by ~21%.
+	reliable := qtype == dns.TypeTXT || (qtype == dns.TypeNULL && s.reliableNULL)
+	if !reliable {
 		if noise && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 			return nil
 		}
@@ -645,7 +655,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 	// echo.
 	var out [][]byte
 	for s.serverBuf.Len() > 0 && len(s.serverOut) < window {
-		maxPayload := maxDownstreamPayloadBudget(dns.TypeTXT, noise, qnameLen, udpBudget, len(out))
+		maxPayload := maxDownstreamPayloadBudget(qtype, noise, qnameLen, udpBudget, len(out))
 		if maxPayload <= 0 || s.serverOutBytes+maxPayload+noiseTagSize > dnsTunnelRetransmitBytes {
 			break
 		}
@@ -674,7 +684,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		// short poll queries retransmit it.
 		oldest := s.serverOutOrder[0]
 		frame := encodeDownstreamFrame(oldest, s.serverSkipTo, s.serverOut[oldest].ct)
-		if fitDownstreamPayloadBudget(qnameLen, len(frame), dns.TypeTXT, udpBudget-len(out)*rrWireCost(qnameLen)) >= len(frame) {
+		if fitDownstreamPayloadBudget(qnameLen, len(frame), qtype, udpBudget-len(out)*rrWireCost(qnameLen)) >= len(frame) {
 			out = append(out, frame)
 		}
 	}
@@ -1463,10 +1473,13 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 	// what lets the client verify this resolver path forwards unknown EDNS0
 	// options and NULL rdata unharmed. Pre-v3 clients read only the first
 	// two bytes and ignore the rest.
-	caps := byte(capOptPayload)
+	caps := byte(capOptPayload | capReliableNULL)
 	optEcho := byte(0)
 	if canary := optTunnelData(req); len(canary) >= 2 && canary[0] == optCanaryMagic {
 		optEcho = canary[1]
+		// A v3 client always attaches the canary to its capability exchange;
+		// from here on its NULL queries expect the framed reliable transport.
+		sess.setReliableNULL()
 	}
 	if rr := makeAnswer(q.Name, q.Qtype, encodeTargetResponse(status, udp, caps, optEcho), s.domain); rr != nil {
 		reply.Answer = append(reply.Answer, rr)
@@ -1599,6 +1612,14 @@ func (s *dnsSession) authenticated() bool {
 func (s *dnsSession) markPSKAuthed() {
 	s.mu.Lock()
 	s.pskAuthed = true
+	s.mu.Unlock()
+}
+
+// setReliableNULL records that the session's capability exchange carried a v3
+// canary: its NULL queries expect the framed reliable transport.
+func (s *dnsSession) setReliableNULL() {
+	s.mu.Lock()
+	s.reliableNULL = true
 	s.mu.Unlock()
 }
 

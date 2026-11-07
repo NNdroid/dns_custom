@@ -51,7 +51,9 @@ func startTestDNSServer(tb testing.TB, handler dns.Handler) string {
 	if err != nil {
 		tb.Fatalf("listen for test DNS server: %v", err)
 	}
-	server := &dns.Server{PacketConn: packetConn, Handler: handler}
+	// UDPSize must cover EDNS0-sized queries: the padded capability canary
+	// probes exactly that, and a bare dns.Server defaults its read to 512.
+	server := &dns.Server{PacketConn: packetConn, Handler: handler, UDPSize: dnsTunnelEDNS0UDPSize}
 	go func() {
 		_ = server.ActivateAndServe()
 	}()

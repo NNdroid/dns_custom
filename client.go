@@ -326,6 +326,11 @@ type ClientConfig struct {
 	// PSK is the pre-shared secret for client authentication on servers with
 	// psks configured. Empty = anonymous (refused by PSK servers).
 	PSK string `json:"psk,omitempty"`
+	// DisableNullUpgrade keeps sessions on the configured record type even
+	// when every path and the server verify reliable-NULL capability (the
+	// upgrade adds ~21%% downstream payload by switching TXT sessions to
+	// binary NULL rdata).
+	DisableNullUpgrade bool `json:"disable_null_upgrade,omitempty"`
 	// ExchangeTimeout caps how long one DNS exchange waits for its reply. Zero
 	// uses the default. A lost query costs that much wall clock before the
 	// same chunk is retransmitted, so it dominates throughput under loss. The
@@ -345,22 +350,23 @@ type ClientConfig struct {
 // DialTarget / DialUDPTarget declare the backend per session instead of per
 // client.
 type Client struct {
-	servers         []string
-	domain          string
-	recordType      string
-	publicKey       string
-	target          string
-	edns0           bool
-	log             *zap.SugaredLogger
-	dialer          *net.Dialer
-	tlsConfig       *tls.Config
-	exchangeTimeout time.Duration
-	pollInterval    time.Duration
-	eventHandler    ClientEventHandler
-	marker          string
-	pskKey          []byte
-	events          *eventDispatcher[ClientEvent]
-	evMu            sync.Mutex // guards eventHandler + lazy events creation
+	servers             []string
+	domain              string
+	recordType          string
+	publicKey           string
+	target              string
+	edns0               bool
+	nullUpgradeDisabled bool
+	log                 *zap.SugaredLogger
+	dialer              *net.Dialer
+	tlsConfig           *tls.Config
+	exchangeTimeout     time.Duration
+	pollInterval        time.Duration
+	eventHandler        ClientEventHandler
+	marker              string
+	pskKey              []byte
+	events              *eventDispatcher[ClientEvent]
+	evMu                sync.Mutex // guards eventHandler + lazy events creation
 }
 
 // SetEventHandler installs or replaces the client event handler (nil disables
@@ -438,21 +444,22 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		pollInterval = dnsTunnelPollInterval
 	}
 	return &Client{
-		servers:         cfg.Servers,
-		domain:          cfg.Domain,
-		recordType:      cfg.RecordType,
-		publicKey:       cfg.PublicKey,
-		target:          trimmedTarget,
-		edns0:           cfg.EDNS0,
-		exchangeTimeout: exchangeTimeout,
-		pollInterval:    pollInterval,
-		log:             log,
-		dialer:          cfg.Dialer,
-		tlsConfig:       cfg.TLSConfig,
-		eventHandler:    cfg.EventHandler,
-		pskKey:          pskKeyFromSecret(cfg.PSK),
-		marker:          strings.TrimSpace(cfg.Marker),
-		events:          events,
+		servers:             cfg.Servers,
+		domain:              cfg.Domain,
+		recordType:          cfg.RecordType,
+		publicKey:           cfg.PublicKey,
+		target:              trimmedTarget,
+		edns0:               cfg.EDNS0,
+		nullUpgradeDisabled: cfg.DisableNullUpgrade,
+		exchangeTimeout:     exchangeTimeout,
+		pollInterval:        pollInterval,
+		log:                 log,
+		dialer:              cfg.Dialer,
+		tlsConfig:           cfg.TLSConfig,
+		eventHandler:        cfg.EventHandler,
+		pskKey:              pskKeyFromSecret(cfg.PSK),
+		marker:              strings.TrimSpace(cfg.Marker),
+		events:              events,
 	}, nil
 }
 
@@ -482,20 +489,21 @@ func validateDeclaredTarget(target string) error {
 // directly, so no separate option list is needed.
 func (c *Client) sessionParams(sessionPrefix, declaredTarget string, events *eventDispatcher[ClientEvent]) clientTunnelParams {
 	return clientTunnelParams{
-		servers:        c.servers,
-		domain:         c.domain,
-		recordType:     c.recordType,
-		pubKey:         c.publicKey,
-		sessionPrefix:  sessionPrefix,
-		declaredTarget: declaredTarget,
-		marker:         c.marker,
-		edns0:          c.edns0,
-		log:            c.log,
-		dialer:         c.dialer,
-		tlsConfig:      c.tlsConfig,
-		events:         events,
-		pskKey:         c.pskKey,
-		tuning:         tunnelTuning{exchangeTimeout: c.exchangeTimeout, pollInterval: c.pollInterval},
+		servers:             c.servers,
+		domain:              c.domain,
+		recordType:          c.recordType,
+		pubKey:              c.publicKey,
+		sessionPrefix:       sessionPrefix,
+		declaredTarget:      declaredTarget,
+		marker:              c.marker,
+		edns0:               c.edns0,
+		nullUpgradeDisabled: c.nullUpgradeDisabled,
+		log:                 c.log,
+		dialer:              c.dialer,
+		tlsConfig:           c.tlsConfig,
+		events:              events,
+		pskKey:              c.pskKey,
+		tuning:              tunnelTuning{exchangeTimeout: c.exchangeTimeout, pollInterval: c.pollInterval},
 	}
 }
 
@@ -686,12 +694,18 @@ type DNSClientTunnel struct {
 	// Protocol v3 capability state, established during the dial sequence:
 	// optPayload = every upstream path verified that it forwards the tunnel
 	// EDNS0 option, so upstream DATA payloads ride the option in binary
-	// (~11x the QNAME budget); serverCaps = capability bits from the target
-	// declaration's response; optCanaryOK = per-path canary results, written
-	// before the pollers start and read-only afterwards.
-	optPayload  bool
-	serverCaps  byte
-	optCanaryOK []bool
+	// (~11x the QNAME budget); nullReliable = every path verified that it
+	// forwards NULL answers intact and the server advertised the reliable
+	// NULL window, so the session upgrades to binary NULL rdata; serverCaps
+	// = capability bits from the target declaration response; the *CanaryOK
+	// slices hold per-path canary results, written before the pollers start
+	// and read-only afterwards.
+	optPayload          bool
+	nullReliable        bool
+	nullUpgradeDisabled bool
+	serverCaps          byte
+	optCanaryOK         []bool
+	nullCanaryOK        []bool
 
 	// pollKick nudges idle pollers as soon as an upstream write completes, so the
 	// server's fresh downstream data is fetched within one RTT instead of after
@@ -736,20 +750,21 @@ func withPollInterval(d time.Duration) tunnelOption {
 // longer touches every call site, and the empty-string / nil positional slots
 // are gone.
 type clientTunnelParams struct {
-	servers        []string
-	domain         string
-	recordType     string
-	pubKey         string
-	sessionPrefix  string
-	declaredTarget string
-	marker         string
-	edns0          bool
-	log            *zap.SugaredLogger
-	dialer         *net.Dialer
-	tlsConfig      *tls.Config
-	events         *eventDispatcher[ClientEvent]
-	pskKey         []byte
-	tuning         tunnelTuning
+	servers             []string
+	domain              string
+	recordType          string
+	pubKey              string
+	sessionPrefix       string
+	declaredTarget      string
+	marker              string
+	edns0               bool
+	nullUpgradeDisabled bool
+	log                 *zap.SugaredLogger
+	dialer              *net.Dialer
+	tlsConfig           *tls.Config
+	events              *eventDispatcher[ClientEvent]
+	pskKey              []byte
+	tuning              tunnelTuning
 }
 
 func newDNSClientTunnel(ctx context.Context, p clientTunnelParams) (*DNSClientTunnel, error) {
@@ -785,35 +800,37 @@ func newDNSClientTunnel(ctx context.Context, p clientTunnelParams) (*DNSClientTu
 		return nil, err
 	}
 	t := &DNSClientTunnel{
-		ctx:             cctx,
-		cancel:          cancel,
-		servers:         p.servers,
-		domain:          dns.Fqdn(p.domain),
-		qtype:           qtype,
-		edns0:           p.edns0,
-		session:         p.sessionPrefix + randomSessionID(),
-		declaredTarget:  p.declaredTarget,
-		pskKey:          p.pskKey,
-		marker:          p.marker,
-		chunkSize:       dnsTunnelDefaultChunk,
-		exchangeTimeout: tuning.exchangeTimeout,
-		pollInterval:    tuning.pollInterval,
-		log:             p.log,
-		dialer:          p.dialer,
-		tlsConfig:       p.tlsConfig,
-		events:          p.events,
-		doneCh:          make(chan struct{}),
-		inBuf:           new(bytes.Buffer),
-		pollKick:        make(chan struct{}, len(paths)),
-		closeCh:         make(chan struct{}),
-		recvNext:        1,
-		recvOOO:         make(map[uint32][]byte),
-		failUntil:       make([]atomic.Int64, len(p.servers)),
-		paths:           paths,
-		window:          dnsTunnelUpstreamWindow,
+		ctx:                 cctx,
+		cancel:              cancel,
+		servers:             p.servers,
+		domain:              dns.Fqdn(p.domain),
+		qtype:               qtype,
+		edns0:               p.edns0,
+		nullUpgradeDisabled: p.nullUpgradeDisabled,
+		session:             p.sessionPrefix + randomSessionID(),
+		declaredTarget:      p.declaredTarget,
+		pskKey:              p.pskKey,
+		marker:              p.marker,
+		chunkSize:           dnsTunnelDefaultChunk,
+		exchangeTimeout:     tuning.exchangeTimeout,
+		pollInterval:        tuning.pollInterval,
+		log:                 p.log,
+		dialer:              p.dialer,
+		tlsConfig:           p.tlsConfig,
+		events:              p.events,
+		doneCh:              make(chan struct{}),
+		inBuf:               new(bytes.Buffer),
+		pollKick:            make(chan struct{}, len(paths)),
+		closeCh:             make(chan struct{}),
+		recvNext:            1,
+		recvOOO:             make(map[uint32][]byte),
+		failUntil:           make([]atomic.Int64, len(p.servers)),
+		paths:               paths,
+		window:              dnsTunnelUpstreamWindow,
 	}
 	if p.edns0 {
 		t.optCanaryOK = make([]bool, len(paths))
+		t.nullCanaryOK = make([]bool, len(paths))
 	}
 
 	if p.pubKey != "" {
@@ -953,6 +970,12 @@ func (t *DNSClientTunnel) edns0Effective() bool {
 // the QNAME's base32 budget. Every other flag (and any fallback) keeps the
 // payload in the QNAME.
 func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
+	return t.buildQueryQtype(t.qtype, dataSeq, flag, wirePayload)
+}
+
+// buildQueryQtype is buildQuery with an explicit record type: the
+// capability canaries probe a different qtype than the session carries.
+func (t *DNSClientTunnel) buildQueryQtype(qtype uint16, dataSeq uint32, flag byte, wirePayload []byte) *dns.Msg {
 	qnamePayload := wirePayload
 	optPayload := []byte(nil)
 	if flag == flagData && t.optPayload && len(wirePayload) > 0 {
@@ -965,7 +988,7 @@ func (t *DNSClientTunnel) buildQuery(dataSeq uint32, flag byte, wirePayload []by
 	name := buildQueryNameRandomized(t.marker, t.domain, t.session, seq, atomic.LoadUint32(&t.ack), dataSeq, flag, qnamePayload)
 
 	m := new(dns.Msg)
-	m.SetQuestion(name, t.qtype)
+	m.SetQuestion(name, qtype)
 	m.RecursionDesired = true
 	// The DNS transaction ID must be independent of the query counter: a
 	// sequential ID lets an off-path attacker who has seen one query predict
@@ -1358,7 +1381,10 @@ func (t *DNSClientTunnel) deliverDownstream(raw []byte) int {
 	}
 	noise := t.noiseSession != nil && t.noiseSession.RecvCipher != nil
 
-	if t.qtype == dns.TypeTXT {
+	// TXT always, NULL once the session verified reliable-NULL capability:
+	// both ride the framed, windowed, retransmitted transport.
+	framed := t.qtype == dns.TypeTXT || (t.qtype == dns.TypeNULL && t.nullReliable)
+	if framed {
 		serverSeq, skipTo, tail, ok := decodeDownstreamFrame(raw)
 		if !ok {
 			// Not a framed chunk (legacy or truncated answer). Without a sequence
@@ -2171,11 +2197,15 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 // conservative 32-byte (22-byte with Noise) fallback.
 // verifyOptPayload canaries every upstream path that the target-declaration
 // exchange did not already verify (the exchange canaries the path that
-// answered it as a side effect). The session enables binary OPT payloads only
-// when EVERY path forwarded the canary: chunks are routed across all paths
-// uniformly, so a single OPT-stripping resolver would corrupt every large
-// chunk routed through it. Anonymous sessions stay in QNAME mode - the server
-// ignores OPT payloads from them, matching the big-pipe response policy.
+// verifyOptPayload canaries every upstream path: a padded canary on a
+// TXT-recorded T query proves the path forwards unknown EDNS0 options and
+// accepts large queries (upstream OPT payloads), and the same probe on a
+// NULL-recorded T query proves NULL answers arrive intact (the reliable-NULL
+// upgrade). The session enables each capability only when EVERY path passed:
+// chunks are routed across all paths uniformly, so a single stripping resolver
+// would corrupt every large chunk routed through it. Anonymous sessions skip
+// the upgrade - the server ignores OPT payloads from them, matching the
+// big-pipe response policy.
 func (t *DNSClientTunnel) verifyOptPayload() {
 	if !t.edns0 || t.optCanaryOK == nil {
 		return
@@ -2185,33 +2215,59 @@ func (t *DNSClientTunnel) verifyOptPayload() {
 	}
 	var wg sync.WaitGroup
 	for i := range t.paths {
-		if t.optCanaryOK[i] {
-			continue
-		}
-		wg.Add(1)
+		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
 			defer t.guardGoroutine("opt canary")
-			t.optCanaryOK[i] = t.optCanaryOnePath(i)
+			t.optCanaryOK[i] = t.capabilityCanary(i, dns.TypeTXT)
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			defer t.guardGoroutine("null canary")
+			t.nullCanaryOK[i] = t.capabilityCanary(i, dns.TypeNULL)
 		}(i)
 	}
 	wg.Wait()
+
+	optOK := true
 	for _, ok := range t.optCanaryOK {
-		if !ok {
-			t.log.Debugf("session %s: OPT canary failed on a path; upstream stays in QNAME mode", t.session)
-			return
-		}
+		optOK = optOK && ok
 	}
-	t.optPayload = true
-	// The declaration exchange sized chunks for the QNAME budget; re-run now
-	// that the OPT budget applies.
-	t.setChunkSize()
+	if optOK {
+		t.optPayload = true
+		// The declaration exchange sized chunks for the QNAME budget; re-run
+		// now that the OPT budget applies.
+		t.setChunkSize()
+	} else {
+		t.log.Debugf("session %s: OPT canary failed on a path; upstream stays in QNAME mode", t.session)
+	}
+
+	// Reliable NULL needs the server to serve NULL through the framed window
+	// (caps bit) on top of intact NULL forwarding on every path. An explicit
+	// record_type null session keeps its qtype and just gains the reliable
+	// framing; a TXT session upgrades to binary NULL rdata outright.
+	nullOK := true
+	for _, ok := range t.nullCanaryOK {
+		nullOK = nullOK && ok
+	}
+	if nullOK && t.serverCaps&capReliableNULL != 0 && !t.nullUpgradeDisabled {
+		if t.qtype == dns.TypeTXT {
+			t.qtype = dns.TypeNULL
+			t.log.Debugf("session %s: upgraded to reliable NULL rdata", t.session)
+		}
+		t.nullReliable = true
+	} else {
+		t.log.Debugf("session %s: NULL canary failed or upgrade disabled; staying on %s",
+			t.session, dns.TypeToString[t.qtype])
+	}
 }
 
-// optCanaryOnePath sends one T query carrying the OPT canary and reports
-// whether the answer mirrored the nonce back.
-func (t *DNSClientTunnel) optCanaryOnePath(idx int) bool {
-	msg := t.buildQuery(dnsTunnelControlSeq, flagTarget, t.declarePayload("", false))
+// capabilityCanary sends one T query carrying the padded OPT canary with the
+// given record type and reports whether the answer mirrored the nonce back.
+// A NULL-recorded canary additionally proves the path forwards NULL answers
+// unharmed; the padded one proves it accepts large queries at all.
+func (t *DNSClientTunnel) capabilityCanary(idx int, qtype uint16) bool {
+	msg := t.buildQueryQtype(qtype, dnsTunnelControlSeq, flagTarget, t.declarePayload("", false))
 	nonce := t.attachOptCanary(msg, true)
 	resp, err := t.paths[idx].exchange(t.ctx, msg)
 	if err != nil || resp == nil {

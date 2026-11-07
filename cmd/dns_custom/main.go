@@ -53,6 +53,7 @@ type Config struct {
 	// (token bucket, burst = rate). 0 = unlimited.
 	QueryRatePerSource int      `json:"query_rate_per_source"` // Server only
 	EDNS0              bool     `json:"edns0"`                 // Announce 1232-byte UDP answers via EDNS0 (set on BOTH ends or the tunnel stalls)
+	DisableNullUpgrade bool     `json:"disable_null_upgrade"`  // Client: keep the configured record type even when reliable-NULL capability verifies
 	Marker             string   `json:"marker"`                // Tunnel marker label; BOTH ends must agree. Empty = built-in "tunnel2"
 	PSK                string   `json:"psk"`                   // Client only: pre-shared secret for PSK-authenticated servers
 	Servers            []string `json:"-"`                     // Parsed upstream DNS servers
@@ -185,6 +186,12 @@ func applyEnvOverrides(cfg *Config) {
 		switch strings.ToLower(v) {
 		case "1", "true", "yes", "y", "on":
 			cfg.EDNS0 = true
+		}
+	}
+	if v := getEnv("DNSCUSTOM_DISABLE_NULL_UPGRADE", "DISABLE_NULL_UPGRADE"); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "y", "on":
+			cfg.DisableNullUpgrade = true
 		}
 	}
 	if v := getEnv("DNSCUSTOM_LOG_LEVEL", "LOG_LEVEL", "LOGLEVEL"); v != "" {
@@ -435,17 +442,18 @@ func buildServerConfig(cfg *Config) dnstunnel.ServerConfig {
 
 func buildClientConfig(cfg *Config) dnstunnel.ClientConfig {
 	cc := dnstunnel.ClientConfig{
-		Domain:          cfg.Domain,
-		Servers:         cfg.Servers,
-		RecordType:      cfg.RecordType,
-		PublicKey:       cfg.PubKey,
-		Target:          cfg.Target,
-		EDNS0:           cfg.EDNS0,
-		Logger:          zlog,
-		ExchangeTimeout: cfg.ExchangeTimeout,
-		PollInterval:    cfg.PollInterval,
-		Marker:          cfg.Marker,
-		PSK:             cfg.PSK,
+		Domain:             cfg.Domain,
+		Servers:            cfg.Servers,
+		RecordType:         cfg.RecordType,
+		PublicKey:          cfg.PubKey,
+		Target:             cfg.Target,
+		EDNS0:              cfg.EDNS0,
+		Logger:             zlog,
+		ExchangeTimeout:    cfg.ExchangeTimeout,
+		PollInterval:       cfg.PollInterval,
+		Marker:             cfg.Marker,
+		PSK:                cfg.PSK,
+		DisableNullUpgrade: cfg.DisableNullUpgrade,
 	}
 	if cc.RecordType == "" {
 		cc.RecordType = "txt"
