@@ -641,6 +641,7 @@ type DNSClientTunnel struct {
 	// Deadlines for the net.Conn interface. The blocking waits check these after
 	// every wake-up; armDeadline broadcasts the wait conditions on expiry.
 	deadlineMu    sync.Mutex
+	deadlineTimer *time.Timer // the single armed wake-up; reset on every SetDeadline
 	readDeadline  time.Time
 	writeDeadline time.Time
 
@@ -2360,14 +2361,30 @@ func (t *DNSClientTunnel) SetWriteDeadline(deadline time.Time) error {
 	return nil
 }
 
-// armDeadline wakes the blocking waits once the deadline passes. Read re-checks the
-// stored deadline after every wake-up, so a broadcast is all that is needed.
+// armDeadline schedules the wake-up that unblocks the blocking waits once the
+// deadline passes. Read re-checks the stored deadline after every wake-up, so a
+// broadcast is all that is needed. Exactly one timer is kept: setting a new
+// deadline (or clearing one with the zero time) cancels the previous timer, so
+// repeated SetDeadline calls do not accumulate timers that outlive their
+// purpose. A deadline already in the past wakes the waiters immediately,
+// matching the SetReadDeadline contract that an expired deadline unblocks
+// pending calls.
 func (t *DNSClientTunnel) armDeadline(deadline time.Time) {
-	if deadline.IsZero() {
-		return
+	t.deadlineMu.Lock()
+	if t.deadlineTimer != nil {
+		t.deadlineTimer.Stop()
+		t.deadlineTimer = nil
 	}
-	if delta := time.Until(deadline); delta > 0 {
-		time.AfterFunc(delta, t.wakeWaiters)
+	expired := !deadline.IsZero() && !time.Now().Before(deadline)
+	if !deadline.IsZero() && !expired {
+		t.deadlineTimer = time.AfterFunc(time.Until(deadline), t.wakeWaiters)
+	}
+	t.deadlineMu.Unlock()
+	if expired {
+		// wakeWaiters takes inMu, and Read holds inMu while taking deadlineMu,
+		// so the broadcast must run outside deadlineMu to keep the lock order
+		// one-directional.
+		t.wakeWaiters()
 	}
 }
 

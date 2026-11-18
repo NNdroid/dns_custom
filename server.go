@@ -300,10 +300,12 @@ type dnsSession struct {
 	// reliableNULL records that the session's capability exchange carried a
 	// v3 canary, so NULL queries from this session expect the same framed,
 	// windowed downstream transport as TXT. Legacy clients never send the
-	// canary and keep the best-effort NULL path. Set before any data query of
-	// a v3 session (the capability exchange precedes the pollers), read-only
-	// afterwards.
-	reliableNULL bool
+	// canary and keep the best-effort NULL path. Atomic because setTarget's
+	// canary query and the session's first NULL data query are processed by
+	// concurrent handler goroutines (resolvers reorder across paths); the
+	// memory-model race aside, Load() orders the store before any later data
+	// query so the framed path is picked up as soon as it is set.
+	reliableNULL atomic.Bool
 	tcpConn      net.Conn
 	udpConn      net.Conn
 	noiseSession *NoiseSession
@@ -542,6 +544,21 @@ func (s *dnsSession) readFramedFromClient() ([]byte, bool) {
 	return payload, true
 }
 
+// dropOutOrderPrefix removes the n oldest keys from serverOutOrder in place so
+// the FIFO reuses its backing array; re-slicing from index 1 would leak eight
+// bytes of it per pop on a long ack stream until the next append reallocates.
+// The map entries must already be deleted by the caller; the vacated tail is
+// zeroed so stale *downstreamChunk pointers do not pin the chunks until the
+// slots are overwritten. Caller must hold s.mu.
+func (s *dnsSession) dropOutOrderPrefix(n int) {
+	if n <= 0 {
+		return
+	}
+	copy(s.serverOutOrder, s.serverOutOrder[n:])
+	clear(s.serverOutOrder[len(s.serverOutOrder)-n:])
+	s.serverOutOrder = s.serverOutOrder[:len(s.serverOutOrder)-n]
+}
+
 // freeDownstream drops downstream chunks the client has confirmed (ack = highest
 // contiguous serverSeq it received). Keeps the retransmit buffer bounded.
 func (s *dnsSession) freeDownstream(ack uint32) {
@@ -549,15 +566,17 @@ func (s *dnsSession) freeDownstream(ack uint32) {
 	// serverOut holds a contiguous seq range in FIFO order (new chunks are
 	// appended with increasing serverNext and the client acks contiguously), so
 	// everything acked is a prefix — pop it instead of scanning the whole map.
-	for len(s.serverOutOrder) > 0 {
-		front := s.serverOutOrder[0]
+	popped := 0
+	for popped < len(s.serverOutOrder) {
+		front := s.serverOutOrder[popped]
 		if seqLess(ack, front) { // front > ack, not yet acked
 			break
 		}
 		s.serverOutBytes -= len(s.serverOut[front].ct)
 		delete(s.serverOut, front)
-		s.serverOutOrder = s.serverOutOrder[1:]
+		popped++
 	}
+	s.dropOutOrderPrefix(popped)
 	drained := s.closed && s.serverBuf.Len() == 0 && len(s.serverOut) == 0
 	s.mu.Unlock()
 	if drained && s.server != nil {
@@ -604,7 +623,7 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 	noise := s.noiseSession != nil && s.noiseSession.SendCipher != nil
 	// NULL rides the reliable window once the session's capability exchange
 	// proved a v3 client: binary rdata with frames beats base32 TXT by ~21%.
-	reliable := qtype == dns.TypeTXT || (qtype == dns.TypeNULL && s.reliableNULL)
+	reliable := qtype == dns.TypeTXT || (qtype == dns.TypeNULL && s.reliableNULL.Load())
 	if !reliable {
 		if noise && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 			return nil
@@ -626,16 +645,18 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 	}
 
 	// Abandon chunks the client never acked within the give-up window.
-	for len(s.serverOut) > 0 {
-		oldest := s.serverOutOrder[0]
+	abandoned := 0
+	for abandoned < len(s.serverOutOrder) {
+		oldest := s.serverOutOrder[abandoned]
 		if time.Since(s.serverOut[oldest].firstSent) <= dnsTunnelDownstreamGiveUp {
 			break
 		}
 		s.serverOutBytes -= len(s.serverOut[oldest].ct)
 		delete(s.serverOut, oldest)
-		s.serverOutOrder = s.serverOutOrder[1:]
 		s.serverSkipTo = oldest + 1
+		abandoned++
 	}
+	s.dropOutOrderPrefix(abandoned)
 
 	// hadPending records whether any un-acked chunk existed before this reply:
 	// serverOutOrder is FIFO, so if it did, its front is a pre-existing chunk
@@ -676,7 +697,12 @@ func (s *dnsSession) serveDownstream(qtype uint16, qnameLen int, udpBudget int) 
 		s.serverOutBytes += len(ct)
 		s.serverOutOrder = append(s.serverOutOrder, seq)
 		out = append(out, encodeDownstreamFrame(seq, s.serverSkipTo, ct))
-		spentRdata += encodedRdataSize(len(ct), qtype)
+		// Account for the frame the way it hits the wire: the answer RR encodes
+		// header + ct, not ct alone. Counting the payload without the 8-byte
+		// downstream header under-claimed each packed RR by ~13 bytes (TXT) /
+		// 8 (NULL), which let a multi-RR reply overshoot the negotiated budget
+		// until the client's truncated datagram failed to unpack.
+		spentRdata += encodedRdataSize(len(ct)+downstreamHeaderSize, qtype)
 	}
 
 	if hadPending && len(s.serverOut) > 0 {
@@ -833,6 +859,13 @@ func NewDNSServer(cfg ServerConfig) (*DNSServer, error) {
 	}
 	if len(srv.pskKeys) > 0 {
 		srv.log.Infof("🔑 Client authentication enabled (%d PSK)", len(srv.pskKeys))
+	}
+	if cfg.MaxSessions == 0 {
+		// A warning rather than a hard failure: unlimited sessions are a
+		// legitimate choice for a trusted or firewalled deployment, but on a
+		// public listener every unique session ID seen in a query allocates a
+		// session shell, so the operator should opt into that memory bound.
+		srv.log.Warn("max_sessions is unlimited (0): any source that can reach the listener may grow the session table until idle expiry; set max_sessions to bound memory under a session flood")
 	}
 	return srv, nil
 }
@@ -1634,9 +1667,7 @@ func (s *dnsSession) markPSKAuthed() {
 // setReliableNULL records that the session's capability exchange carried a v3
 // canary: its NULL queries expect the framed reliable transport.
 func (s *dnsSession) setReliableNULL() {
-	s.mu.Lock()
-	s.reliableNULL = true
-	s.mu.Unlock()
+	s.reliableNULL.Store(true)
 }
 
 // srcLimiter is a tiny token bucket keyed by source IP.

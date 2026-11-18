@@ -434,7 +434,7 @@ func TestNullCanaryFallsBackToTXT(t *testing.T) {
 // reliable window; one without it keeps the legacy best-effort path.
 func TestServerReliableNULLWindow(t *testing.T) {
 	s := newDnsSession("nullreliable0123", "", "tcp", "127.0.0.1:1", false, nil, nopLogger, nil)
-	s.reliableNULL = true
+	s.reliableNULL.Store(true)
 	if !s.pushServer(bytes.Repeat([]byte{0x71}, 2048)) {
 		t.Fatal("pushServer rejected payload")
 	}
