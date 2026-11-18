@@ -4,7 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
+
+	"github.com/skip2/go-qrcode"
 
 	dnstunnel "github.com/NNdroid/dns_custom"
 )
@@ -30,7 +31,11 @@ type StunProfile struct {
 	NoisePublicKey    string `json:"noisePublicKey"`
 }
 
-func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin string) string {
+// GenerateDNSCustomURI builds both sharing artifacts for the Stun Android / TV
+// client: the PIN-encrypted stun:// envelope (plus the PIN that opens it) and
+// the plaintext dnsc:// URI for non-Stun clients. It only builds; printing is
+// the caller's job so the output appears exactly once and in one place.
+func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin string) (stunURI, protoURI, usedPIN string, err error) {
 	pubHex, pubB64 := "", ""
 	if pubKey != "" {
 		if pk, err := dnstunnel.ParseNoiseKey(pubKey); err == nil {
@@ -48,7 +53,12 @@ func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin strin
 		name = "DNS Custom - " + domain
 	}
 
-	// 1. Official Stun Sharing Link (stun://, encrypted like the Stun Android / TV client)
+	// Official Stun Sharing Link (stun://, encrypted like the Stun Android / TV
+	// client). A failed encryption is a hard error, not a downgrade: the
+	// fallback to a plaintext stun:// would silently ship the profile (domain,
+	// resolvers, pubkey) to whoever scans the QR code, and an encryption
+	// failure usually means something is wrong with the environment. Fail
+	// loudly instead.
 	prof := StunProfile{
 		Name:             name,
 		SSHAddr:          "127.0.0.1:22",
@@ -60,29 +70,18 @@ func GenerateDNSCustomURI(domain, pubKey, servers, recordType, remark, pin strin
 		DNSTunnelType:    recordType,
 		NoisePublicKey:   rawPub,
 	}
-	profJSON, _ := json.Marshal(prof)
-	// A failed encryption is a hard error, not a downgrade: the fallback to a
-	// plaintext stun:// would silently ship the profile (domain, resolvers,
-	// pubkey) to whoever scans the QR code, and an encryption failure usually
-	// means something is wrong with the environment. Fail loudly instead.
-	stunURI, usedPin, err := encryptStunURI(profJSON, pin)
+	profJSON, mErr := json.Marshal(prof)
+	if mErr != nil {
+		return "", "", "", fmt.Errorf("marshal share profile: %w", mErr)
+	}
+	stunURI, usedPIN, err = encryptStunURI(profJSON, pin)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to encrypt share URI: %v\n", err)
-		os.Exit(1)
+		return "", "", usedPIN, err
 	}
 
-	// 2. Direct Protocol URI (plaintext, for non-Stun clients)
-	protoURI := generateDirectProtocolURI(domain, rawPub, servers, recordType)
-
-	fmt.Printf("\n[1] Official Stun Sharing Link (stun://, encrypted):\n  %s\n", stunURI)
-	if pin == "" {
-		fmt.Printf("\n[PIN] %s  <- share this PIN with the importer (Stun App will ask for it)\n", usedPin)
-	} else {
-		fmt.Printf("\n[PIN] (using provided PIN)\n")
-	}
-	fmt.Printf("\n[2] Direct Protocol URI (plaintext):\n  %s\n\n", protoURI)
-
-	return stunURI
+	// Direct Protocol URI (plaintext, for non-Stun clients).
+	protoURI = generateDirectProtocolURI(domain, rawPub, servers, recordType)
+	return stunURI, protoURI, usedPIN, nil
 }
 
 func generateDirectProtocolURI(domain, pubKey, servers, recordType string) string {
@@ -95,7 +94,16 @@ func generateDirectProtocolURI(domain, pubKey, servers, recordType string) strin
 	return (&url.URL{Scheme: "dnsc", Host: domain, RawQuery: query.Encode()}).String()
 }
 
+// PrintTerminalQR renders the share URI as a half-block terminal QR code so the
+// Stun Android / TV app can scan it straight off the screen instead of typing
+// out a several-hundred-character URI. A rendering failure degrades to pointing
+// at the URI printed above rather than aborting the share.
 func PrintTerminalQR(text string) {
-	fmt.Println("Scan in Stun Android / TV App (Supports stun:// and direct scan):")
-	fmt.Printf("\n  %s\n\n", text)
+	qr, err := qrcode.New(text, qrcode.Medium)
+	if err != nil {
+		fmt.Printf("\n(QR rendering failed: %v — scan or copy the URI above)\n", err)
+		return
+	}
+	fmt.Println("\nScan in Stun Android / TV App (Supports stun:// and direct scan):")
+	fmt.Println(qr.ToSmallString(false))
 }

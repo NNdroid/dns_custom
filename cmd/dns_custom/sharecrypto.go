@@ -41,12 +41,15 @@ type shareEnvelope struct {
 
 // GenerateRandomPIN returns a random 6-digit PIN string, identical to ShareCryptoUtils.generateRandomPIN.
 // Numeric only, so UTF-8 and Java's char[] (ISO-8859-1) encodings are byte-identical during PBKDF2.
-func GenerateRandomPIN() string {
+func GenerateRandomPIN() (string, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(1000000))
 	if err != nil {
-		return "000000"
+		// A fallback like "000000" would silently ship a predictable PIN; the
+		// caller fails the share generation loudly instead, matching the
+		// no-downgrade stance of encryptStunURI.
+		return "", fmt.Errorf("generate share PIN: %w", err)
 	}
-	return fmt.Sprintf("%06d", n.Int64())
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func gzipData(b []byte) ([]byte, error) {
@@ -84,7 +87,10 @@ func gunzipData(b []byte) ([]byte, error) {
 func encryptStunURI(plainText []byte, pin string) (uri, usedPin string, err error) {
 	usedPin = pin
 	if usedPin == "" {
-		usedPin = GenerateRandomPIN()
+		var pinErr error
+		if usedPin, pinErr = GenerateRandomPIN(); pinErr != nil {
+			return "", usedPin, pinErr
+		}
 	}
 
 	// Optional gzip: only enable when it actually shrinks the plaintext (mirrors Android logic,

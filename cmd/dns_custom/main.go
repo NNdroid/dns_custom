@@ -412,9 +412,20 @@ func runGenURI(args []string) {
 		*remark = "DNS Custom Node"
 	}
 
-	uri := GenerateDNSCustomURI(*domain, *pubKey, *servers, *recordType, *remark, *pin)
-	fmt.Printf("=== 📱 dns_custom Sharing URI (encrypted stun://) ===\n\n%s\n", uri)
-	PrintTerminalQR(uri)
+	stunURI, protoURI, usedPIN, err := GenerateDNSCustomURI(*domain, *pubKey, *servers, *recordType, *remark, *pin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to generate share URI: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("=== 📱 dns_custom Sharing URI (encrypted stun://) ===\n")
+	fmt.Printf("\n[1] Official Stun Sharing Link (stun://, encrypted):\n  %s\n", stunURI)
+	if *pin == "" {
+		fmt.Printf("\n[PIN] %s  <- share this PIN with the importer (Stun App will ask for it)\n", usedPIN)
+	} else {
+		fmt.Printf("\n[PIN] (using provided PIN)\n")
+	}
+	fmt.Printf("\n[2] Direct Protocol URI (plaintext):\n  %s\n", protoURI)
+	PrintTerminalQR(stunURI)
 }
 
 func buildServerConfig(cfg *Config) dnstunnel.ServerConfig {
