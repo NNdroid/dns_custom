@@ -144,9 +144,9 @@ const (
 )
 
 // dnsTunnelControlSeq is a reserved sequence number outside both data streams,
-// used only by flagTarget queries and their payloads. The AEAD nonce is derived
-// from the sequence, so a control exchange must never collide with a data chunk
-// nonce; a stream would need 4 billion chunks (~137 GB) to reach it.
+// used only by flagTarget queries carrying a target declaration. The AEAD nonce
+// is derived from the sequence, so a control exchange must never collide with a
+// data chunk nonce; a stream would need 4 billion chunks (~137 GB) to reach it.
 const dnsTunnelControlSeq = ^uint32(0)
 
 // dnsTunnelCloseSeq is a second reserved sequence, used only by authenticated
@@ -156,6 +156,16 @@ const dnsTunnelControlSeq = ^uint32(0)
 // keystream. Like dnsTunnelControlSeq it is unreachable by data chunks short of
 // ~4 billion of them.
 const dnsTunnelCloseSeq = ^uint32(0) - 1
+
+// dnsTunnelCanarySeq is a third reserved sequence, used only by the v3
+// capability canaries. Every control purpose must seal under its own sequence
+// because the nonce is derived from it: the declaration body, the canary body
+// and the close tag are different plaintexts, and sealing two of them under one
+// nonce and key would reuse the keystream - with the ciphertexts riding
+// plaintext QNAMEs, an on-path observer could XOR them back apart and recover
+// the declared backend address. Like the other two it is unreachable by data
+// chunks short of ~4 billion of them.
+const dnsTunnelCanarySeq = dnsTunnelCloseSeq - 1
 
 // seqLess compares two sequence numbers safely across uint32 wraparound.
 // Plain `<` would misread a fresh chunk as a stale duplicate once the counter
@@ -774,9 +784,17 @@ func extractAnswer(rr dns.RR) []byte {
 //
 //	request  [udpMarker:1][addr...]  udpMarker = 1 for a udp:// target, 0 for tcp;
 //	                                 addr empty = "use the server default".
-//	                                 Encrypted with the reserved control sequence
-//	                                 when Noise is on (the backend address is the
-//	                                 sensitive part), plaintext otherwise.
+//	                                 Encrypted when Noise is on (the backend
+//	                                 address is the sensitive part) under a
+//	                                 per-purpose reserved sequence: a declaration
+//	                                 seals under dnsTunnelControlSeq, a
+//	                                 capability canary under dnsTunnelCanarySeq -
+//	                                 the nonce is derived from the sequence, so
+//	                                 two different control plaintexts must never
+//	                                 share one. Plaintext otherwise.
+//	                                 The query's dataSeq field carries the same
+//	                                 reserved sequence so the server knows which
+//	                                 nonce to decrypt with.
 //	                                 When EDNS0 is enabled the query also carries
 //	                                 the tunnel OPT option (below) with a canary
 //	                                 payload, so the reply doubles as the

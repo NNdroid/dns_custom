@@ -1245,7 +1245,7 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 		sess.freeDownstream(ack)
-		s.serveTargetDeclaration(w, req, reply, sess, data)
+		s.serveTargetDeclaration(w, req, reply, sess, data, dataSeq)
 		return
 	}
 
@@ -1384,8 +1384,20 @@ func (s *DNSServer) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 // validate against the allow list, apply to the session and answer with
 // [status][udpMarker]. The answer is always 2 plaintext bytes so it fits every
 // record type and leaks nothing but the transport.
-func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns.Msg, sess *dnsSession, data []byte) {
+//
+// The AEAD nonce is derived from the control sequence, so the client states
+// which purpose its payload serves by carrying the reserved sequence in the
+// query's dataSeq field (declaration = dnsTunnelControlSeq, capability canary =
+// dnsTunnelCanarySeq). That keeps every control plaintext under its own nonce -
+// sealing two of them under one would let an observer XOR the ciphertexts back
+// apart. Anything outside the reserved set is refused before the decryption.
+func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns.Msg, sess *dnsSession, data []byte, ctrlSeq uint32) {
 	q := req.Question[0]
+	if ctrlSeq != dnsTunnelControlSeq && ctrlSeq != dnsTunnelCanarySeq {
+		reply.SetRcode(req, dns.RcodeNameError)
+		_ = w.WriteMsg(reply)
+		return
+	}
 	payload := data
 	if s.hasPrivKey {
 		if sess.noiseSession == nil {
@@ -1394,7 +1406,7 @@ func (s *DNSServer) serveTargetDeclaration(w dns.ResponseWriter, req, reply *dns
 			_ = w.WriteMsg(reply)
 			return
 		}
-		dec, err := sess.noiseSession.RecvCipher.Decrypt(uint64(dnsTunnelControlSeq), data)
+		dec, err := sess.noiseSession.RecvCipher.Decrypt(uint64(ctrlSeq), data)
 		if err != nil {
 			s.log.Warnf("[%s] Target declaration decryption failed: %v", sess.sessionID, err)
 			reply.SetRcode(req, dns.RcodeNameError)

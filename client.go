@@ -2048,9 +2048,12 @@ func (t *DNSClientTunnel) sendCloseSignal() {
 	_, _ = path.exchange(ctx, m)
 }
 
-// declarePayload builds the T-query payload for one declaration: the PSK proof
-// prefix when configured, then the encrypted (or plaintext) declaration body.
-func (t *DNSClientTunnel) declarePayload(addr string, wantUDP bool) []byte {
+// declareBody builds the unsealed body of a T query: the PSK proof prefix when
+// configured, then the declaration. Callers seal it with sealControl under the
+// reserved sequence for their purpose (declaration vs capability canary) - the
+// AEAD nonce is derived from that sequence, so two different control plaintexts
+// must never share one.
+func (t *DNSClientTunnel) declareBody(addr string, wantUDP bool) []byte {
 	payload := encodeTargetRequest(addr, wantUDP)
 	if t.pskKey != nil {
 		// Client authentication: the probe carries HMAC-SHA256(psk, sessionID)
@@ -2058,10 +2061,18 @@ func (t *DNSClientTunnel) declarePayload(addr string, wantUDP bool) []byte {
 		// placed in front of the declaration; the server strips and verifies it.
 		payload = append(pskProof(t.pskKey, t.session), payload...)
 	}
-	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
-		payload = t.noiseSession.SendCipher.Encrypt(uint64(dnsTunnelControlSeq), payload)
-	}
 	return payload
+}
+
+// sealControl encrypts a control body under the AEAD nonce derived from seq
+// (plaintext when Noise is off). Retransmissions of the same control query
+// re-seal under the same seq and yield byte-identical ciphertexts on purpose:
+// the server dedups by decrypting, and a deterministic seal leaks nothing new.
+func (t *DNSClientTunnel) sealControl(seq uint32, body []byte) []byte {
+	if t.noiseSession != nil && t.noiseSession.SendCipher != nil {
+		return t.noiseSession.SendCipher.Encrypt(uint64(seq), body)
+	}
+	return body
 }
 
 // attachOptCanary appends the v3 capability canary ([magic][nonce]) to a T
@@ -2100,7 +2111,7 @@ func (t *DNSClientTunnel) declareTarget(target string) (string, error) {
 		}
 		addr, wantUDP = host, network == "udp"
 	}
-	payload := t.declarePayload(addr, wantUDP)
+	payload := t.sealControl(dnsTunnelControlSeq, t.declareBody(addr, wantUDP))
 
 	// Multiple attempts ensure the server has a chance to answer even if some
 	// queries are lost. A slow Noise handshake is retried across attempts.
@@ -2267,7 +2278,7 @@ func (t *DNSClientTunnel) verifyOptPayload() {
 // A NULL-recorded canary additionally proves the path forwards NULL answers
 // unharmed; the padded one proves it accepts large queries at all.
 func (t *DNSClientTunnel) capabilityCanary(idx int, qtype uint16) bool {
-	msg := t.buildQueryQtype(qtype, dnsTunnelControlSeq, flagTarget, t.declarePayload("", false))
+	msg := t.buildQueryQtype(qtype, dnsTunnelCanarySeq, flagTarget, t.sealControl(dnsTunnelCanarySeq, t.declareBody("", false)))
 	nonce := t.attachOptCanary(msg, true)
 	resp, err := t.paths[idx].exchange(t.ctx, msg)
 	if err != nil || resp == nil {
