@@ -10,7 +10,7 @@ High-Performance Authoritative DNS Tunnel Server & Client with Noise_NK Curve255
 - **Client-Declared Targets with ACL**: Clients can declare the backend they want per session; the server validates it against an `allow_targets` pattern list (`"tcp://127.0.0.1:*"`, `"udp://10.8.0.*:51820"`) and always answers with the transport that applies. One server can safely serve many different backends.
 - **Embeddable Go Library**: The root package `dnstunnel` exposes `Server.Run(ctx)` / `Client.Dial(ctx) (net.Conn)` / `Client.DialUDP(ctx) (net.PacketConn)`, so external programs can borrow the tunnel through standard connection interfaces (see [Using as a Go Library](#using-as-a-go-library)).
 - **8 DNS Record Types**: Supports `TXT`, `NULL`, `CNAME`, `A`, `AAAA`, `MX`, `SRV`, and `NS`.
-- **Optional EDNS0**: With `"edns0": true` on both ends, answers announce a 1232-byte UDP budget instead of 512 — much larger downstream chunks and near-doubled throughput.
+- **Optional EDNS0**: With `"edns0": true`, answers announce a 1232-byte UDP budget instead of 512 — much larger downstream chunks and near-doubled throughput. The flag is per-direction: the client's `edns0` unlocks v3 upstream mode and the reliable-NULL upgrade (once canaries verify the resolvers), the server's `edns0` sizes its downstream answers — a mismatch never stalls the tunnel, it only leaves the corresponding direction at the legacy 512-byte budget.
 - **Fast Lane over TCP**: Point the client's `servers` at a `tcp://` resolver (or any resolver forwarding over TCP) and the server serves ~8 KiB chunks — no datagram size limit applies. Measured ~2× over plain UDP on loopback.
 - **Upstream DNS Transports**: Client supports standard UDP/TCP DNS, DNS-over-TLS (`tls://` / `dot://`), and DNS-over-HTTPS (`https://` / `doh://`).
 - **Network-Change Recovery**: pooled DNS sockets are discarded after transport or DNS-response failures, polling survives resolver/interface outages, and an in-flight write retries with capped backoff until its context or write deadline expires. Authoritative `NXDOMAIN` is treated as an expired server session instead of a successful write.
@@ -73,8 +73,8 @@ journalctl -u dns_custom -f   # View live logs
 | `listen` | `string` | server `":53"`, client `"127.0.0.1:1080"` | Server: authoritative DNS listen address. Client: local address to bind — its transport (TCP or UDP) follows the backend automatically (declared `target` or server default). |
 | `target` | `string` | `"tcp://127.0.0.1:22"` | Server: default backend (`tcp://host:port` or `udp://host:port`). Client: optional backend declaration — must pass the server's `allow_targets` list, or the session is rejected. |
 | `allow_targets` | `array` | `[]` | Server only: patterns granting client-declared targets, e.g. `"tcp://127.0.0.1:*"`, `"udp://10.8.0.*:51820"`; scheme/host/port may each be `*`, host wildcards never cross a dot. Empty = default target only; `"*"` allows everything (dangerous). |
-| `max_sessions` | `int` | `0` | Server only: concurrent session cap (each session holds up to ~600KB of buffers on UDP paths, up to ~4.5MB on `tcp://` upstreams whose retransmission window is byte-bounded). `0` = unlimited. |
-| `edns0` | `bool` | `false` | Announce 1232-byte UDP answers via EDNS0 instead of the 512-byte limit — much larger downstream chunks, packed replies (several chunks per answer), and it unlocks v3 upstream mode: once a padded per-path canary proves the resolver forwards unknown EDNS0 options and large queries, upstream payloads ride a binary option (~1 KiB per query vs ~90 in the QNAME). Set on **both** ends or the tunnel stalls. **Only takes effect on an authenticated session** (`pubkey`/Noise or `psk`): the server caps anonymous answers at the legacy 512-byte budget so an open deployment cannot be used as a big-pipe amplifier. |
+| `max_sessions` | `int` | `0` | Server only: concurrent session cap (each session holds up to ~600KB of buffers on UDP paths, up to ~4.5MB on `tcp://` upstreams whose retransmission window is byte-bounded). `0` = unlimited — **strongly discouraged on a public listener**: every unique session ID seen in a query allocates a session shell until idle expiry, so the server logs a warning at startup and you should set a cap. |
+| `edns0` | `bool` | `false` | Announce 1232-byte UDP answers via EDNS0 instead of the 512-byte limit — much larger downstream chunks, packed replies (several chunks per answer), and it unlocks v3 upstream mode: once a padded per-path canary proves the resolver forwards unknown EDNS0 options and large queries, upstream payloads ride a binary option (~1 KiB per query vs ~90 in the QNAME). The flag is per-direction: the client's `edns0` unlocks upstream OPT payloads and the reliable-NULL upgrade, the server's `edns0` sizes its downstream answers — a mismatch never stalls the tunnel, it only leaves the corresponding direction at the legacy 512-byte budget. **Only takes effect on an authenticated session** (`pubkey`/Noise or `psk`): the server caps anonymous answers at the legacy 512-byte budget so an open deployment cannot be used as a big-pipe amplifier. |
 |  |  |  | *Steady-state throughput ladder (same server, loopback, one session): plain UDP ≈ 3.3 MB/s, EDNS0 ≈ 3.3 MB/s, `tcp://` upstream ≈ 3.1 MB/s - loopback is scheduler-bound, so the per-query payload gains from v3 (OPT upstream ~11x, reliable NULL ~1.2x downstream, packed TCP replies) show on real latency-bound paths, where throughput ≈ window × payload ÷ RTT. `BenchmarkTunnelThroughputColdStart` keeps the per-dial cost visible.* |
 | `exchange_timeout` | `duration` | `4s` | Client only: how long one DNS exchange waits for its reply. A lost query burns exactly that much wall clock before the same chunk is retransmitted, so under loss this dominates throughput more than the query rate does. The wait is also clamped down to eight times the session's best observed round trip, floored at 500 ms, so a 200 ms path never spends 20× its RTT discovering one dropped query; a session with no measurement yet waits the floor, not the ceiling. Lower it to fail over a dead upstream faster, raise it for a very janky path. |
 | `poll_interval` | `duration` | `50ms` | Client only: how often a downstream poll is sent when there is nothing queued. Downstream bytes arrive only as answers to the client's own polls, so on a clean path this interval — not bandwidth, not chunk size — sets the read rate. Lower it to trade idle DNS queries for lower read latency. |
@@ -84,6 +84,11 @@ journalctl -u dns_custom -f   # View live logs
 | `servers` | `array|string` | `["8.8.8.8:53", "1.1.1.1:53"]` | Upstream DNS servers (JSON array or comma-separated; supports UDP, TCP, DoT, DoH). |
 | `record_type` | `string` | `"txt"` | Tunnel query DNS record type: `txt`, `null`, `cname`, `a`, `aaaa`, `mx`, `srv`, `ns`. |
 | `log_level` | `string` | `"info"` | Logging output level: `debug`, `info`, `warn`, `error`. |
+| `psks` | `array` | `[]` | Server only: shared secrets clients must prove via HMAC-SHA256 in their capability probe. Multiple entries are allowed; a client matches if its `psk` derives one of them. Empty = anonymous clients may use the default target. The proof gates **session creation and close signals**, not stream integrity — an on-path observer of a plaintext session can replay it; use `privkey`/Noise for integrity. |
+| `psk` | `string` | `""` | Client only: the pre-shared secret matching one of the server's `psks`. Empty = anonymous (refused by PSK servers). |
+| `query_rate_per_source` | `int` | `0` | Server only: queries per second allowed from one source IP (token bucket, burst = rate; excess dropped silently, RRL-style). `0` = unlimited — strongly discouraged on public-facing listeners. |
+| `marker` | `string` | `"tunnel2"` | Tunnel marker label inside the query name. **Both ends must agree.** A custom marker replaces the built-in default exclusively — the default is not also accepted, so default-configured strangers cannot open sessions on the same domain. Empty = built-in `tunnel2`. |
+| `disable_null_upgrade` | `bool` | `false` | Client only: keep the configured `record_type` even when every path and the server verify reliable-NULL capability (the upgrade switches TXT sessions to binary NULL rdata for ~21% more downstream payload). |
 
 ---
 
@@ -163,8 +168,8 @@ matching.
 ## Environment Variables
 
 `DNSCUSTOM_*` variables override fields present in the config file loaded via
-`-c` (handy for Docker); short aliases exist for a few of them (`MODE`,
-`LISTEN`, `PORT`, `TYPE`, `LOGLEVEL`):
+`-c` (handy for Docker); most fields also accept a short bare-name alias
+without the prefix (`MODE`, `LISTEN`, `PORT`, `TYPE`, `LOGLEVEL`, `PSK`, ...):
 
 | Variable | Overrides |
 | :--- | :--- |
@@ -179,6 +184,11 @@ matching.
 | `DNSCUSTOM_ALLOW_TARGETS` | `allow_targets` (comma-separated) |
 | `DNSCUSTOM_MAX_SESSIONS` | `max_sessions` |
 | `DNSCUSTOM_EDNS0` | `edns0` (`1`/`true`/`yes`/`on`) |
+| `DNSCUSTOM_DISABLE_NULL_UPGRADE` | `disable_null_upgrade` (`1`/`true`/`yes`/`on`) |
+| `DNSCUSTOM_MARKER` | `marker` |
+| `DNSCUSTOM_PSKS` | `psks` (comma-separated) |
+| `DNSCUSTOM_PSK` | `psk` |
+| `DNSCUSTOM_QUERY_RATE_PER_SOURCE` | `query_rate_per_source` |
 | `DNSCUSTOM_LOG_LEVEL` | `log_level` |
 | `DNSCUSTOM_EXCHANGE_TIMEOUT` | `exchange_timeout` (Go duration, e.g. `1s`, `800ms`) |
 | `DNSCUSTOM_POLL_INTERVAL` | `poll_interval` (Go duration, e.g. `25ms`) |
